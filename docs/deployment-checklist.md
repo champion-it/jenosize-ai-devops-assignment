@@ -9,7 +9,7 @@ Set these once and reuse them in the commands below.
 ```bash
 export PROJECT_ID="jenosize-jenie"          # your project
 export REGION="asia-southeast1"             # Singapore, closest to Thailand
-export REPO="champion-it/jenosize-ai-devops-assignment"
+export REPO="champion-it/jenosize-ai-devops-assignment-yodthong"
 export REGISTRY="${REGION}-docker.pkg.dev/${PROJECT_ID}/jenie"
 ```
 

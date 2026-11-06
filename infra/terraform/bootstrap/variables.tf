@@ -24,7 +24,7 @@ variable "github_repository" {
 
   validation {
     condition     = can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", var.github_repository))
-    error_message = "Must be owner/name, for example champion-it/jenosize-ai-devops-assignment."
+    error_message = "Must be owner/name, for example champion-it/jenosize-ai-devops-assignment-yodthong."
   }
 }
 
