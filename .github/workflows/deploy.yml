@@ -27,9 +27,14 @@ concurrency:
 jobs:
   deploy-dev:
     name: Deploy to dev
+    # Skipped until the Google Cloud repository variables are set, so a
+    # checkout without them still shows a green pipeline rather than a
+    # wall of credential failures. Setting the variables activates this
+    # job; no change here is needed.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.workflow_run.conclusion == 'success') &&
+      vars.GCP_PROJECT_ID != ''
     runs-on: ubuntu-latest
     environment: dev
     outputs:
@@ -93,6 +98,7 @@ jobs:
   deploy-prod:
     name: Deploy to prod (canary)
     needs: deploy-dev
+    if: vars.GCP_PROJECT_ID != ''
     runs-on: ubuntu-latest
     # The prod environment carries a required reviewer, so this job waits for
     # a human before any production traffic moves.

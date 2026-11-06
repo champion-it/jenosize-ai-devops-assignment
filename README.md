@@ -310,6 +310,13 @@ of silently becoming the real configuration. A pull-based reconciler such as
 Argo CD or Flux would add automatic correction, but both need Kubernetes to
 run in, which is the trade Cloud Run was chosen to avoid.
 
+Jobs that need Google Cloud are guarded on `vars.GCP_PROJECT_ID`. Until the
+repository variables from `bootstrap` are set, those jobs skip and the
+pipeline is green on lint, tests, scanning, the integration evaluation and
+`terraform validate`. Setting the variables activates deployment and drift
+detection with no change to the workflows. A checkout of this repository
+therefore shows a passing pipeline without access to any cloud account.
+
 Plans on pull requests from forks are skipped deliberately: GitHub withholds
 the id-token and write permissions there, so the job could only fail.
 `validate` still runs, which is the gate that matters for an external change.

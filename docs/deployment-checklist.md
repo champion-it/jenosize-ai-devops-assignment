@@ -198,6 +198,11 @@ source of truth and nothing is applied from a workstation.
 
       gh run list --repo "$REPO" --limit 5
 
+  Before the variables are set, the cloud jobs skip and the pipeline is green
+  on lint, tests, scanning, the integration evaluation and
+  `terraform validate`. After they are set, `build`, `apply` and the drift
+  check start running on their own.
+
 **Check:** open a trivial pull request touching `infra/` and confirm the
 `terraform` workflow posts a plan comment on it.
 

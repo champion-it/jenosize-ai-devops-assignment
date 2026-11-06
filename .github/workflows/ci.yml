@@ -109,7 +109,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint, test, dependency-scan, integration]
     # Images are only published from main. Pull requests build but do not push.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Skipped until the Google Cloud repository variables are set, so a
+    # checkout without them still shows a green pipeline rather than a
+    # wall of credential failures. Setting the variables activates this
+    # job; no change here is needed.
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      vars.GCP_PROJECT_ID != ''
     strategy:
       matrix:
         service: [api, worker]
