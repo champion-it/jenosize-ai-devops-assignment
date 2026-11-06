@@ -5,6 +5,7 @@ Terraform for the Jenie Helpdesk AI platform on Google Cloud.
 ## Layout
 
 ```
+bootstrap/        APIs, state bucket, Artifact Registry, WIF, CI identities
 modules/
   network/        VPC, subnet, private service access, firewall, Cloud Armor
   database/       Cloud SQL Postgres with pgvector, backups, DATABASE_URL secret
@@ -20,17 +21,24 @@ pass, which is what keeps dev a true rehearsal for prod.
 
 ## First run
 
+Apply [`bootstrap/`](bootstrap/README.md) first. It enables the APIs, creates
+the state bucket, the Artifact Registry repository, the Workload Identity
+federation and the two CI service accounts. An environment apply fails
+without it, because it cannot enable the APIs it needs in order to run.
+
 ```bash
-cd envs/dev
-cp backend.hcl.example backend.hcl           # set your state bucket
-cp terraform.tfvars.example terraform.tfvars # set project and images
+cd bootstrap
+cp terraform.tfvars.example terraform.tfvars
+terraform init && terraform apply
+terraform output github_repository_variables   # set these in the repository
+
+cd ../envs/dev
+cp backend.hcl.example backend.hcl             # bucket from the output above
+cp terraform.tfvars.example terraform.tfvars
 terraform init -backend-config=backend.hcl
 terraform plan
 terraform apply
 ```
-
-Required APIs: `run`, `sqladmin`, `secretmanager`, `artifactregistry`,
-`servicenetworking`, `compute`, `cloudscheduler`, `monitoring`, `logging`.
 
 ## State
 
@@ -38,10 +46,10 @@ State is in a GCS bucket with object versioning enabled, one prefix per
 environment. GCS provides state locking natively, so no separate lock table
 is needed.
 
-The bucket is deliberately not managed by this configuration. A configuration
-that holds its own state bucket cannot be destroyed or recreated cleanly, so
-the bucket is created once by hand or by a separate bootstrap configuration
-and then left alone.
+The bucket is created by [`bootstrap/`](bootstrap/README.md), not by the
+environments. A configuration that holds its own state bucket cannot be
+destroyed or recreated cleanly, so bootstrap keeps its state locally and the
+environments keep theirs in the bucket it creates.
 
 Recovery from corrupted state is `gsutil cp` of the previous object version
 over the current one. Object versioning is what makes that possible, so it is

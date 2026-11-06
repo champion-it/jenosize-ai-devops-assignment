@@ -95,6 +95,7 @@ attributed to the vector search or to the model without guessing.
 │   └── tests/
 ├── infra/
 │   └── terraform/
+│       ├── bootstrap/       APIs, state bucket, registry, WIF, CI identities
 │       ├── modules/
 │       │   ├── network/         VPC, private service access, Cloud Armor
 │       │   ├── database/        Cloud SQL, backups, DATABASE_URL secret
@@ -164,6 +165,17 @@ Two environments built from the same modules.
 
 Terraform state lives in a versioned GCS bucket, one prefix per environment.
 See [`infra/terraform/README.md`](infra/terraform/README.md).
+
+`infra/terraform/bootstrap` holds what has to exist before either environment
+can be applied: enabled APIs, the state bucket, the Artifact Registry
+repository, the GitHub federation and the two CI service accounts. It is
+applied once by a human and keeps its state locally, because a configuration
+cannot keep state in a bucket it is also creating.
+
+The scope here is a workload landing zone, not an organisation one. Folder
+hierarchy, org policies, Shared VPC, CMEK and VPC Service Controls need
+organisation-level permissions and are out of scope for this assignment;
+everything the service itself needs to run safely in a project is present.
 
 ---
 

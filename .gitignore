@@ -17,6 +17,8 @@ htmlcov/
 !*.tfvars.example
 crash.log
 .terraform.lock.hcl
+backend.hcl
+!backend.hcl.example
 
 # Local data
 .data/

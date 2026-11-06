@@ -67,6 +67,28 @@ jobs:
         working-directory: infra/terraform/envs/${{ matrix.env }}
         run: terraform validate
 
+  validate-bootstrap:
+    name: Validate (bootstrap)
+    runs-on: ubuntu-latest
+    # Validated here but never planned or applied by CI. Bootstrap needs
+    # broader permissions than the pipeline identity has, on purpose, and it
+    # keeps its state locally.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Init without backend
+        working-directory: infra/terraform/bootstrap
+        run: terraform init -backend=false -input=false
+
+      - name: Validate
+        working-directory: infra/terraform/bootstrap
+        run: terraform validate
+
   plan:
     name: Plan (${{ matrix.env }})
     needs: validate

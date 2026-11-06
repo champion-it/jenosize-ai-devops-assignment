@@ -1,0 +1,14 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is git ignored.
+#
+# project_number: gcloud projects describe <project_id> --format='value(projectNumber)'
+# billing_account: gcloud billing accounts list
+
+project_id        = "jenosize-jenie"
+project_number    = "123456789012"
+region            = "asia-southeast1"
+state_bucket_name = "jenosize-jenie-tfstate"
+github_repository = "champion-it/jenosize-ai-devops-assignment"
+
+# Optional. Omit to skip the budget.
+billing_account = "000000-AAAAAA-BBBBBB"
+monthly_budget  = 50
