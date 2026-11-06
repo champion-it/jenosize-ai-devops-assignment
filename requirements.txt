@@ -1,0 +1,8 @@
+# Runtime dependencies shared by the API and the worker.
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+psycopg[binary]==3.2.13
+psycopg-pool==3.2.6
+prometheus-client==0.21.1
+pydantic==2.10.4
+pydantic-settings==2.7.0

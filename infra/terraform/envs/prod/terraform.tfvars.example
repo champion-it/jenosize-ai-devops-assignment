@@ -1,0 +1,5 @@
+project_id   = "jenosize-jenie-prod"
+region       = "asia-southeast1"
+api_image    = "asia-southeast1-docker.pkg.prod/jenosize-jenie-prod/jenie/api:bootstrap"
+worker_image = "asia-southeast1-docker.pkg.prod/jenosize-jenie-prod/jenie/worker:bootstrap"
+alert_emails = ["platform@example.com"]

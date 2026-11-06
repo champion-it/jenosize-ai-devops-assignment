@@ -1,0 +1,42 @@
+[
+  {
+    "query": "How do I reset my password if I forgot it?",
+    "expected_title": "Password Reset"
+  },
+  {
+    "query": "My VPN keeps disconnecting every few minutes, what should I check?",
+    "expected_title": "VPN Access"
+  },
+  {
+    "query": "What is the mailbox size quota and what happens when it is full?",
+    "expected_title": "Email Setup"
+  },
+  {
+    "query": "I lost my laptop, what do I need to do?",
+    "expected_title": "Laptop Request and Replacement"
+  },
+  {
+    "query": "Can I get local administrator rights on my managed device?",
+    "expected_title": "Software Installation"
+  },
+  {
+    "query": "Why was push approval replaced with number matching?",
+    "expected_title": "Multi Factor Authentication"
+  },
+  {
+    "query": "How long do I have to submit an expense claim and what evidence is needed?",
+    "expected_title": "Expense Reimbursement"
+  },
+  {
+    "query": "What severity level is a confirmed data breach?",
+    "expected_title": "Incident Reporting"
+  },
+  {
+    "query": "Can I share confidential data with an external party?",
+    "expected_title": "Data Classification"
+  },
+  {
+    "query": "What happens to a contractor account when the contract ends?",
+    "expected_title": "Offboarding Checklist"
+  }
+]

@@ -1,0 +1,120 @@
+name: jenie-helpdesk-ai
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-jenie}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jenie}
+      POSTGRES_DB: ${POSTGRES_DB:-jenie}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-jenie} -d ${POSTGRES_DB:-jenie}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Not published to the host. Only the application services reach it.
+    expose:
+      - "5432"
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-jenie}:${POSTGRES_PASSWORD:-jenie}@postgres:5432/${POSTGRES_DB:-jenie}
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: local
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-hashing}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATA_PATH: /data
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-jenie}:${POSTGRES_PASSWORD:-jenie}@postgres:5432/${POSTGRES_DB:-jenie}
+      ENVIRONMENT: local
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-hashing}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATA_PATH: /data
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Runs to completion rather than staying up. Started on demand with
+    # `docker compose run --rm worker`, or once at boot by the profile below.
+    profiles:
+      - ingest
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts:/etc/prometheus/alerts:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres-data:

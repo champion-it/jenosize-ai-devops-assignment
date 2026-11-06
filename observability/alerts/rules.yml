@@ -1,0 +1,69 @@
+groups:
+  - name: jenie-api-slo
+    interval: 30s
+    rules:
+      # Availability SLO: 99% of requests succeed over a rolling 30 days.
+      # This alert fires on the short window so the budget is defended before
+      # it is spent, not after.
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(http_requests_total{status="5xx"}[5m]))
+            /
+            clamp_min(sum(rate(http_requests_total[5m])), 0.001)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          service: jenie-api
+        annotations:
+          summary: "Error rate above 5 percent"
+          description: >-
+            More than 5 percent of requests have failed for 5 minutes.
+            Check recent revisions first; roll back by shifting traffic to the
+            previous Cloud Run revision.
+
+      # Latency SLO: p95 of /ask stays under 2 seconds.
+      - alert: HighAskLatency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(http_request_duration_seconds_bucket{route="/ask"}[10m])) by (le)
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+          service: jenie-api
+        annotations:
+          summary: "p95 latency on /ask above 2 seconds"
+          description: >-
+            Compare rag_retrieval_duration_seconds against
+            rag_answer_duration_seconds to see whether the vector search or
+            the model is responsible.
+
+      - alert: RetrievalQualityDrop
+        expr: |
+          (
+            sum(rate(rag_empty_retrieval_total[15m]))
+            /
+            clamp_min(sum(rate(http_requests_total{route="/ask"}[15m])), 0.001)
+          ) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+          service: jenie-api
+        annotations:
+          summary: "More than 20 percent of queries retrieve nothing"
+          description: >-
+            Either the index is stale or incoming questions have drifted away
+            from the indexed corpus. Check the last successful indexer run.
+
+      - alert: ApiDown
+        expr: up{job="jenie-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: jenie-api
+        annotations:
+          summary: "API is not being scraped"
+          description: "Prometheus cannot reach the API metrics endpoint."

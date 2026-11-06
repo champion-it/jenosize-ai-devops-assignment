@@ -1,0 +1,156 @@
+name: deploy
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, prod]
+        default: dev
+      image_tag:
+        description: Image tag to deploy
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-dev:
+    name: Deploy to dev
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: dev
+    outputs:
+      image_tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: resolve
+        run: |
+          TAG="${{ github.event.inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="sha-$(echo "${{ github.event.workflow_run.head_sha || github.sha }}" | cut -c1-12)"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy API, taking all traffic
+        run: |
+          gcloud run deploy jenie-api-dev \
+            --region "${{ vars.GCP_REGION }}" \
+            --image "${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/api:${{ steps.resolve.outputs.tag }}" \
+            --quiet
+
+      - name: Update the indexer job
+        run: |
+          gcloud run jobs update jenie-worker-dev \
+            --region "${{ vars.GCP_REGION }}" \
+            --image "${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/worker:${{ steps.resolve.outputs.tag }}" \
+            --quiet
+
+      - name: Smoke test
+        run: |
+          URL=$(gcloud run services describe jenie-api-dev \
+            --region "${{ vars.GCP_REGION }}" --format='value(status.url)')
+          curl -fsS "$URL/healthz"
+          python3 scripts/eval.py --base-url "$URL" --min-pass-rate 0.8
+
+  deploy-prod:
+    name: Deploy to prod (canary)
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    # The prod environment carries a required reviewer, so this job waits for
+    # a human before any production traffic moves.
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Record the currently serving revision
+        id: stable
+        run: |
+          # Captured before anything moves so rollback has a concrete target
+          # rather than relying on "latest", which the canary has changed.
+          echo "name=$(gcloud run services describe jenie-api-prod \
+            --region '${{ vars.GCP_REGION }}' \
+            --format='value(status.traffic.filter(\"percent:100\").extract(\"revisionName\"))' \
+            | tr -d '[]')" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy new revision with no traffic
+        id: revision
+        run: |
+          gcloud run deploy jenie-api-prod \
+            --region "${{ vars.GCP_REGION }}" \
+            --image "${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/api:${{ needs.deploy-dev.outputs.image_tag }}" \
+            --no-traffic --tag candidate --quiet
+          echo "name=$(gcloud run services describe jenie-api-prod \
+            --region '${{ vars.GCP_REGION }}' \
+            --format='value(status.latestCreatedRevisionName)')" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the candidate before any traffic moves
+        run: |
+          # The candidate tag gives the new revision its own URL, so it can be
+          # exercised end to end while real traffic is still on the old one.
+          URL=$(gcloud run services describe jenie-api-prod \
+            --region "${{ vars.GCP_REGION }}" \
+            --format='value(status.traffic.filter("tag:candidate").extract("url"))' | tr -d '[]')
+          curl -fsS "$URL/healthz"
+          python3 scripts/eval.py --base-url "$URL" --min-pass-rate 0.8 --max-p95-ms 2000
+
+      - name: Shift 10 percent of traffic
+        run: |
+          gcloud run services update-traffic jenie-api-prod \
+            --region "${{ vars.GCP_REGION }}" \
+            --to-revisions "${{ steps.revision.outputs.name }}=10" --quiet
+
+      - name: Hold and verify the canary
+        run: |
+          # Held long enough for the 5 minute error-rate alert window to cover
+          # the canary before it is widened.
+          sleep 300
+          URL=$(gcloud run services describe jenie-api-prod \
+            --region "${{ vars.GCP_REGION }}" --format='value(status.url)')
+          curl -fsS "$URL/healthz"
+          python3 scripts/eval.py --base-url "$URL" --min-pass-rate 0.8
+
+      - name: Promote to 100 percent
+        run: |
+          gcloud run services update-traffic jenie-api-prod \
+            --region "${{ vars.GCP_REGION }}" \
+            --to-revisions "${{ steps.revision.outputs.name }}=100" --quiet
+
+      - name: Roll back
+        if: failure() && steps.stable.outputs.name != ''
+        run: |
+          # Traffic returns to the revision that was serving before this run.
+          # Nothing is rebuilt, so rollback completes in seconds.
+          gcloud run services update-traffic jenie-api-prod \
+            --region "${{ vars.GCP_REGION }}" \
+            --to-revisions "${{ steps.stable.outputs.name }}=100" --quiet
