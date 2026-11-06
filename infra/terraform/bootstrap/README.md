@@ -63,20 +63,36 @@ terraform output github_repository_variables
 | `GCP_TERRAFORM_SERVICE_ACCOUNT` | `terraform.yml` |
 | `GCP_TFSTATE_BUCKET` | `terraform.yml` |
 
-## Then the environments
+## Then an image, then the environments
 
-`envs/dev` and `envs/prod` reference images that do not exist until CI has
-pushed some, so the first apply uses a placeholder tag and the deploy
-pipeline replaces it. The Cloud Run resources carry `ignore_changes` on the
-image, so later applies will not roll it back.
+The order matters. `envs/dev` creates Cloud Run resources that reference an
+image by tag, and Cloud Run rejects a deploy whose image does not exist, so
+the first images are built and pushed before the first `terraform apply`, not
+after it. From then on CI owns the tag, and the Cloud Run resources carry
+`ignore_changes` on the image so a later apply will not roll it back.
 
 ```bash
-cd ../envs/dev
+gcloud auth configure-docker <region>-docker.pkg.dev --quiet
+
+cd "$(git rev-parse --show-toplevel)"
+docker buildx build --platform linux/amd64 \
+  -f api/Dockerfile -t <registry>/api:bootstrap --push .
+docker buildx build --platform linux/amd64 \
+  -f worker/Dockerfile -t <registry>/worker:bootstrap --push .
+
+cd infra/terraform/envs/dev
 cp backend.hcl.example backend.hcl     # bucket = the state bucket above
 cp terraform.tfvars.example terraform.tfvars
 terraform init -backend-config=backend.hcl
 terraform apply
 ```
+
+`--platform linux/amd64` is required when building on an Apple Silicon Mac.
+Cloud Run refuses an arm64 image, and the error names a manifest rather than
+the architecture.
+
+The full sequence, with a verification step after each phase, is in
+[`docs/deployment-checklist.md`](../../../docs/deployment-checklist.md).
 
 After that, infrastructure changes go through `.github/workflows/terraform.yml`
 rather than from a workstation.

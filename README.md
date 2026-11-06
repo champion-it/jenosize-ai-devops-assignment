@@ -29,6 +29,10 @@ open Grafana at http://localhost:3000 (anonymous viewer access is enabled).
 
 ---
 
+Deploying this to a real project: [`docs/deployment-checklist.md`](docs/deployment-checklist.md).
+
+---
+
 ## 2. Scope
 
 Two application services plus their dependencies:
@@ -110,7 +114,9 @@ attributed to the vector search or to the model without guessing.
 │   │   └── provisioning/
 │   ├── prometheus/prometheus.yml
 │   └── alerts/rules.yml         four alert rules
-├── docs/architecture.svg
+├── docs/
+│   ├── architecture.svg
+│   └── deployment-checklist.md  empty project to running service, in order
 ├── data/                        12 markdown knowledge base documents
 ├── scripts/
 │   ├── eval.py                  retrieval evaluation and CI gate
@@ -408,4 +414,4 @@ from the configuration.
 | Observability | 20% | `observability/`, section 9 |
 | Security | 15% | [SECURITY.md](SECURITY.md), section 11 |
 | AI workload readiness | 15% | `worker/`, `scripts/eval.py`, sections 3, 8 and 12 |
-| Documentation | 10% | this file and `infra/terraform/README.md` |
+| Documentation | 10% | this file, `SECURITY.md`, `infra/terraform/README.md`, `docs/deployment-checklist.md` |

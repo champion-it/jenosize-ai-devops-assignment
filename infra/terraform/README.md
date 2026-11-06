@@ -26,12 +26,18 @@ the state bucket, the Artifact Registry repository, the Workload Identity
 federation and the two CI service accounts. An environment apply fails
 without it, because it cannot enable the APIs it needs in order to run.
 
+Images must also exist before the first environment apply: Cloud Run rejects
+a deploy whose image is not in the registry. The full sequence, with a check
+after each phase, is in
+[`docs/deployment-checklist.md`](../../docs/deployment-checklist.md).
+
 ```bash
 cd bootstrap
 cp terraform.tfvars.example terraform.tfvars
 terraform init && terraform apply
 terraform output github_repository_variables   # set these in the repository
 
+# build and push the first images, then
 cd ../envs/dev
 cp backend.hcl.example backend.hcl             # bucket from the output above
 cp terraform.tfvars.example terraform.tfvars
