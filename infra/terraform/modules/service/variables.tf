@@ -85,6 +85,24 @@ variable "llm_provider" {
   default = "mock"
 }
 
+variable "otel_exporter_otlp_endpoint" {
+  description = <<-EOT
+    OTLP endpoint for traces. Null means spans are created but not exported,
+    which still gives every log line a trace id. On GCP this points at an
+    OpenTelemetry Collector that forwards to Cloud Trace; the collector is
+    deliberately not part of this module, so the choice of backend is not
+    baked into the service.
+  EOT
+  type        = string
+  default     = null
+}
+
+variable "otel_sample_ratio" {
+  description = "1.0 traces everything. Lower it in prod once volume justifies it."
+  type        = number
+  default     = 1.0
+}
+
 variable "rate_limit_per_minute" {
   type    = number
   default = 60

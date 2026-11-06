@@ -114,6 +114,19 @@ resource "google_cloud_run_v2_service" "api" {
         value = var.llm_provider
       }
 
+      dynamic "env" {
+        for_each = var.otel_exporter_otlp_endpoint == null ? [] : [1]
+        content {
+          name  = "OTEL_EXPORTER_OTLP_ENDPOINT"
+          value = var.otel_exporter_otlp_endpoint
+        }
+      }
+
+      env {
+        name  = "OTEL_SAMPLE_RATIO"
+        value = tostring(var.otel_sample_ratio)
+      }
+
       env {
         name  = "RATE_LIMIT_PER_MINUTE"
         value = tostring(var.rate_limit_per_minute)
@@ -210,6 +223,14 @@ resource "google_cloud_run_v2_job" "worker" {
         env {
           name  = "EMBEDDING_DIM"
           value = tostring(var.embedding_dim)
+        }
+
+        dynamic "env" {
+          for_each = var.otel_exporter_otlp_endpoint == null ? [] : [1]
+          content {
+            name  = "OTEL_EXPORTER_OTLP_ENDPOINT"
+            value = var.otel_exporter_otlp_endpoint
+          }
         }
 
         env {

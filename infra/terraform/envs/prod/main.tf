@@ -62,6 +62,7 @@ module "service" {
   cpu                   = "2"
   log_level             = "INFO"
   rate_limit_per_minute = 60
+  otel_sample_ratio     = 0.1
   allow_unauthenticated = true
   reindex_schedule      = "0 2 * * *"
 }

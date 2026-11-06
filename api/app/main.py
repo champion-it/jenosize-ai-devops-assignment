@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
@@ -20,6 +21,7 @@ from common.db import Database
 from common.embeddings import build_embedding_provider
 from common.observability import metrics
 from common.observability.logging import configure_logging
+from common.observability.tracing import configure_tracing, get_tracer
 
 logger = logging.getLogger("jenie.api")
 settings = get_settings()
@@ -43,6 +45,14 @@ class AskResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Tracing first: configure_logging attaches the trace id to every record,
+    # so the provider has to exist before the first log line is written.
+    configure_tracing(
+        settings.service_name,
+        settings.environment,
+        settings.otel_exporter_otlp_endpoint,
+        settings.otel_sample_ratio,
+    )
     configure_logging(settings.service_name, settings.environment, settings.log_level)
 
     database = Database(settings.database_url, settings.embedding_dim)
@@ -80,6 +90,14 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# One server span per request, with the incoming traceparent honoured so a
+# trace started by a caller continues here rather than starting again.
+# /metrics and the health probes are excluded: they are scraped and polled
+# constantly and would bury the spans that matter.
+FastAPIInstrumentor.instrument_app(app, excluded_urls="/metrics,/healthz,/readyz")
+
+tracer = get_tracer("jenie.api")
 
 
 @app.middleware("http")
@@ -162,7 +180,16 @@ async def ask(payload: AskRequest, request: Request) -> AskResponse | JSONRespon
     top_k = payload.top_k or settings.top_k
 
     retrieval_started = time.perf_counter()
-    chunks = app.state.retriever.search(payload.query, top_k)
+    with tracer.start_as_current_span("rag.retrieve") as span:
+        span.set_attribute("rag.top_k", top_k)
+        span.set_attribute("rag.query_length", len(payload.query))
+        chunks = app.state.retriever.search(payload.query, top_k)
+        span.set_attribute("rag.matches", len(chunks))
+        if chunks:
+            span.set_attribute("rag.top_score", round(chunks[0].score, 4))
+            span.set_attribute(
+                "rag.sources", ",".join(chunk.title for chunk in chunks[:5])
+            )
     retrieval_seconds = time.perf_counter() - retrieval_started
     metrics.rag_retrieval_duration_seconds.observe(retrieval_seconds)
 
@@ -172,7 +199,12 @@ async def ask(payload: AskRequest, request: Request) -> AskResponse | JSONRespon
         metrics.rag_empty_retrieval_total.inc()
 
     answer_started = time.perf_counter()
-    completion = app.state.llm.complete(payload.query, chunks)
+    with tracer.start_as_current_span("rag.generate") as span:
+        span.set_attribute("llm.provider", app.state.llm.name)
+        span.set_attribute("llm.model", settings.llm_model)
+        completion = app.state.llm.complete(payload.query, chunks)
+        span.set_attribute("llm.input_tokens", completion.input_tokens)
+        span.set_attribute("llm.output_tokens", completion.output_tokens)
     answer_seconds = time.perf_counter() - answer_started
     metrics.rag_answer_duration_seconds.observe(answer_seconds)
 

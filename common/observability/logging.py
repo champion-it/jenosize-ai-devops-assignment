@@ -12,6 +12,8 @@ import logging
 import sys
 from datetime import UTC, datetime
 
+from common.observability.tracing import current_trace_context
+
 RESERVED = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {
     "asctime",
     "message",
@@ -35,6 +37,12 @@ class JsonFormatter(logging.Formatter):
             "service": self.service,
             "environment": self.environment,
         }
+        # Correlation: a log line and the span it happened in carry the same
+        # trace id, so a slow request found in the trace view leads straight
+        # to its logs and back. Empty outside a span, so this is safe
+        # everywhere, including in tests and with no collector running.
+        payload.update(current_trace_context())
+
         for key, value in record.__dict__.items():
             if key not in RESERVED:
                 payload[key] = value

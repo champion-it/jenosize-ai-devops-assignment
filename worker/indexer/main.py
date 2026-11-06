@@ -25,6 +25,11 @@ from common.db import Database, to_vector_literal
 from common.embeddings import build_embedding_provider
 from common.observability import metrics
 from common.observability.logging import configure_logging
+from common.observability.tracing import (
+    configure_tracing,
+    get_tracer,
+    shutdown_tracing,
+)
 
 logger = logging.getLogger("jenie.indexer")
 
@@ -66,6 +71,7 @@ def extract_title(text: str, fallback: str) -> str:
 
 def index_path(path: str, force: bool = False) -> IndexResult:
     settings = get_settings()
+    tracer = get_tracer("jenie.indexer")
     database = Database(settings.database_url, settings.embedding_dim, max_size=4)
     database.open()
     try:
@@ -80,54 +86,60 @@ def index_path(path: str, force: bool = False) -> IndexResult:
             return result
 
         for file in files:
-            text = file.read_text(encoding="utf-8")
-            content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            with tracer.start_as_current_span("index.document") as span:
+                span.set_attribute("document.path", str(file))
+                text = file.read_text(encoding="utf-8")
+                content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-            with database.connection() as conn:
-                if not force:
-                    row = conn.execute(
-                        "SELECT content_hash FROM documents WHERE path = %s",
-                        (str(file),),
-                    ).fetchone()
-                    if row and row[0] == content_hash:
-                        result.skipped += 1
-                        metrics.ingest_documents_total.labels("skipped").inc()
-                        continue
+                with database.connection() as conn:
+                    if not force:
+                        row = conn.execute(
+                            "SELECT content_hash FROM documents WHERE path = %s",
+                            (str(file),),
+                        ).fetchone()
+                        if row and row[0] == content_hash:
+                            result.skipped += 1
+                            metrics.ingest_documents_total.labels("skipped").inc()
+                            continue
 
-                title = extract_title(text, file.stem.replace("-", " ").title())
-                document_id = conn.execute(
-                    UPSERT_DOCUMENT_SQL,
-                    {"path": str(file), "title": title, "hash": content_hash},
-                ).fetchone()[0]
+                    title = extract_title(text, file.stem.replace("-", " ").title())
+                    document_id = conn.execute(
+                        UPSERT_DOCUMENT_SQL,
+                        {"path": str(file), "title": title, "hash": content_hash},
+                    ).fetchone()[0]
 
-                # Chunk ordinals are rewritten below; clearing first stops a
-                # shortened document from leaving orphaned tail chunks behind.
-                conn.execute("DELETE FROM chunks WHERE document_id = %s", (document_id,))
-
-                pieces = split_markdown(text, settings.chunk_size, settings.chunk_overlap)
-                vectors = embeddings.embed([piece.content for piece in pieces])
-
-                for piece, vector in zip(pieces, vectors, strict=False):
+                    # Chunk ordinals are rewritten below; clearing first stops a
+                    # shortened document from leaving orphaned tail chunks behind.
                     conn.execute(
-                        INSERT_CHUNK_SQL,
-                        {
-                            "document_id": document_id,
-                            "ordinal": piece.ordinal,
-                            "heading": piece.heading,
-                            "content": piece.content,
-                            "embedding": to_vector_literal(vector),
-                            "model": embeddings.name,
-                        },
+                        "DELETE FROM chunks WHERE document_id = %s", (document_id,)
                     )
-                conn.commit()
 
-            result.documents += 1
-            result.chunks += len(pieces)
-            metrics.ingest_documents_total.labels("indexed").inc()
-            logger.info(
-                "indexed document",
-                extra={"path": str(file), "title": title, "chunks": len(pieces)},
-            )
+                    pieces = split_markdown(
+                        text, settings.chunk_size, settings.chunk_overlap
+                    )
+                    vectors = embeddings.embed([piece.content for piece in pieces])
+
+                    for piece, vector in zip(pieces, vectors, strict=False):
+                        conn.execute(
+                            INSERT_CHUNK_SQL,
+                            {
+                                "document_id": document_id,
+                                "ordinal": piece.ordinal,
+                                "heading": piece.heading,
+                                "content": piece.content,
+                                "embedding": to_vector_literal(vector),
+                                "model": embeddings.name,
+                            },
+                        )
+                    conn.commit()
+
+                result.documents += 1
+                result.chunks += len(pieces)
+                metrics.ingest_documents_total.labels("indexed").inc()
+                logger.info(
+                    "indexed document",
+                    extra={"path": str(file), "title": title, "chunks": len(pieces)},
+                )
 
         return result
     finally:
@@ -147,12 +159,23 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    configure_tracing(
+        "jenie-worker",
+        settings.environment,
+        settings.otel_exporter_otlp_endpoint,
+        settings.otel_sample_ratio,
+    )
+
     started = time.perf_counter()
     try:
         result = index_path(args.path, force=args.force)
     except Exception:
         logger.exception("indexing run failed", extra={"path": args.path})
         return 1
+    finally:
+        # The job exits in well under the batch export interval, so the spans
+        # have to be flushed explicitly or they never leave the process.
+        shutdown_tracing()
 
     duration = time.perf_counter() - started
     metrics.ingest_duration_seconds.observe(duration)

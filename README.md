@@ -26,6 +26,7 @@ open Grafana at http://localhost:3000 (anonymous viewer access is enabled).
 | Metrics | http://localhost:8000/metrics |
 | Grafana | http://localhost:3000 |
 | Prometheus | http://localhost:9090 |
+| Jaeger | http://localhost:16686 |
 
 ---
 
@@ -82,8 +83,9 @@ attributed to the vector search or to the model without guessing.
 │   ├── chunker.py               heading-aware markdown splitting
 │   ├── embeddings.py            embedding provider interface
 │   └── observability/
-│       ├── logging.py           structured JSON logging
-│       └── metrics.py           Prometheus metric definitions
+│       ├── logging.py           structured JSON logging, trace-correlated
+│       ├── metrics.py           Prometheus metric definitions
+│       └── tracing.py           OpenTelemetry provider and span helpers
 ├── api/
 │   ├── Dockerfile
 │   └── app/
@@ -251,6 +253,43 @@ Logs are JSON, one object per line, with a request id on every line and
 request middleware logs timing and match counts; the query body is never
 logged, so logs do not become a copy of user input.
 
+### Tracing
+
+OpenTelemetry, exported over OTLP. One server span per request, with the
+incoming `traceparent` honoured so a trace started by a caller continues
+here, and two child spans that split the `/ask` budget:
+
+```
+POST /ask                    2.75 ms   http.route=/ask  http.status_code=200
+  rag.retrieve               1.24 ms   rag.matches=5  rag.top_k=5
+                                       rag.top_score=0.19
+                                       rag.sources=VPN Access,Printer Troubleshooting,...
+  rag.generate               0.03 ms   llm.provider=mock  llm.model=mock-1
+                                       llm.input_tokens=407  llm.output_tokens=110
+```
+
+The indexer emits a span per document, so a single slow file is visible
+rather than averaged into the run.
+
+Every log line carries the `trace_id` and `span_id` of the span it was
+written in, so a slow request found in the trace view leads straight to its
+logs and back.
+
+Spans are always created; the endpoint only controls whether they are
+exported. With `OTEL_EXPORTER_OTLP_ENDPOINT` unset the provider runs without
+an exporter, which keeps the trace id available for log correlation in unit
+tests and on a laptop with no collector, and means an unreachable collector
+cannot stop the service from starting.
+
+`/metrics`, `/healthz` and `/readyz` are excluded from tracing: they are
+scraped and polled constantly and would bury the spans that matter.
+
+Locally the collector is Jaeger. On GCP, `otel_exporter_otlp_endpoint` points
+at an OpenTelemetry Collector forwarding to Cloud Trace; the collector is
+deliberately not part of the service module, so the backend is not baked in.
+Dev samples everything, prod samples 10 percent, and sampling is
+`ParentBased`, so a sampled trace is never missing its middle.
+
 Alert rules in [`observability/alerts/rules.yml`](observability/alerts/rules.yml):
 
 1. `HighErrorRate` - 5xx rate above 5 percent for 5 minutes.
@@ -399,7 +438,7 @@ from the configuration.
 
 | Check | Result |
 | --- | --- |
-| Unit tests | 36 passed |
+| Unit tests | 46 passed |
 | `ruff check` / `ruff format --check` | clean |
 | `terraform validate`, dev and prod | both valid |
 | Workflow YAML, all three | valid; no event payload reaches a shell command |
@@ -409,6 +448,9 @@ from the configuration.
 | Rate limiter at 60/min | 60 × 200, then 5 × 429 |
 | Prometheus target | up, four alert rules loaded and healthy |
 | Grafana | dashboard provisioned, every panel query returns data |
+| Tracing | `jenie-api` and `jenie-worker` traces in Jaeger; `/ask` trace carries `rag.retrieve` and `rag.generate` children |
+| Log correlation | every request log line carries `trace_id` and `span_id` |
+| Cold start | clean volumes, no `.env`, overridden host ports: stack up, ingest, `/ask`, eval, dashboards all working |
 
 ---
 

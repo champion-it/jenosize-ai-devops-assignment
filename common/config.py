@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     llm_input_cost_per_1k: float = 0.00015
     llm_output_cost_per_1k: float = 0.0006
 
+    # Unset means spans are created but not exported. See tracing.py.
+    otel_exporter_otlp_endpoint: str | None = None
+    otel_sample_ratio: float = 1.0
+
     top_k: int = 5
     rate_limit_per_minute: int = 60
     data_path: str = "/data"

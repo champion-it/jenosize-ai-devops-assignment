@@ -40,6 +40,7 @@ services:
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-hashing}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
       LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DATA_PATH: /data
     ports:
@@ -68,6 +69,7 @@ services:
       ENVIRONMENT: local
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-hashing}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DATA_PATH: /data
     volumes:
@@ -86,6 +88,15 @@ services:
     # `docker compose run --rm worker`, or once at boot by the profile below.
     profiles:
       - ingest
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "${JAEGER_PORT:-16686}:16686"   # UI
+    expose:
+      - "4318"                          # OTLP over HTTP
 
   prometheus:
     image: prom/prometheus:v3.1.0
