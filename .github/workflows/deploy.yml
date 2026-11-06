@@ -39,10 +39,25 @@ jobs:
 
       - name: Resolve image tag
         id: resolve
+        # Values reach the shell through the environment, never through
+        # expression interpolation into the script body: a tag containing
+        # shell metacharacters would otherwise be executed rather than read.
+        # The result is constrained to the characters a tag may contain, so a
+        # malformed value fails here instead of reaching a deploy command.
+        env:
+          INPUT_TAG: ${{ github.event.inputs.image_tag }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          FALLBACK_SHA: ${{ github.sha }}
         run: |
-          TAG="${{ github.event.inputs.image_tag }}"
+          set -euo pipefail
+          TAG="${INPUT_TAG:-}"
           if [ -z "$TAG" ]; then
-            TAG="sha-$(echo "${{ github.event.workflow_run.head_sha || github.sha }}" | cut -c1-12)"
+            SHA="${RUN_SHA:-$FALLBACK_SHA}"
+            TAG="sha-$(printf '%s' "$SHA" | cut -c1-12)"
+          fi
+          if ! printf '%s' "$TAG" | grep -qE '^[A-Za-z0-9._-]{1,128}$'; then
+            echo "::error::refusing to deploy an image tag with unexpected characters"
+            exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 

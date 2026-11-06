@@ -109,13 +109,15 @@ attributed to the vector search or to the model without guessing.
 │   │   └── provisioning/
 │   ├── prometheus/prometheus.yml
 │   └── alerts/rules.yml         four alert rules
+├── docs/architecture.svg
 ├── data/                        12 markdown knowledge base documents
 ├── scripts/
 │   ├── eval.py                  retrieval evaluation and CI gate
 │   └── eval_queries.json
 ├── .github/workflows/
 │   ├── ci.yml                   lint, test, scan, integration, build, push
-│   └── deploy.yml               dev deploy, prod canary, rollback
+│   ├── deploy.yml               dev deploy, prod canary, rollback
+│   └── terraform.yml            plan on PR, apply on merge, daily drift check
 ├── docker-compose.yml
 ├── README.md
 └── SECURITY.md
@@ -272,6 +274,32 @@ verifies it on its own URL, shifts 10 percent, holds long enough for the error
 rate alert window to cover it, then promotes. Any failure shifts traffic back
 to the recorded revision; nothing is rebuilt, so rollback takes seconds.
 
+### Infrastructure changes
+
+`terraform.yml` makes the repository the source of truth for infrastructure,
+not just for code:
+
+| Trigger | What happens |
+| --- | --- |
+| Pull request touching `infra/**` | `fmt`, `validate` and `plan` for both environments; the plan is posted as a PR comment and updated in place on each push |
+| Merge to `main` | `apply` to dev, then to prod behind a required reviewer |
+| Daily schedule | `plan -detailed-exitcode` against live infrastructure; exit code 2 means reality has diverged, and the run opens or refreshes a `drift` issue with the pending changes |
+
+This is the part of GitOps that applies without a cluster: every change
+arrives through a reviewed pull request with the plan visible before merge,
+and a change made by hand in the console is surfaced the next morning instead
+of silently becoming the real configuration. A pull-based reconciler such as
+Argo CD or Flux would add automatic correction, but both need Kubernetes to
+run in, which is the trade Cloud Run was chosen to avoid.
+
+Plans on pull requests from forks are skipped deliberately: GitHub withholds
+the id-token and write permissions there, so the job could only fail.
+`validate` still runs, which is the gate that matters for an external change.
+
+No value from an event payload is interpolated into a shell command anywhere
+in the three workflows; inputs reach the shell through the environment, and
+the resolved image tag is pattern-checked before it reaches a deploy command.
+
 ---
 
 ## 11. Security
@@ -349,6 +377,7 @@ from the configuration.
 | Unit tests | 36 passed |
 | `ruff check` / `ruff format --check` | clean |
 | `terraform validate`, dev and prod | both valid |
+| Workflow YAML, all three | valid; no event payload reaches a shell command |
 | `terraform fmt -check -recursive` | clean |
 | Ingest | 12 documents, 45 chunks, 79 ms |
 | Retrieval evaluation | pass rate 100 percent, MRR 0.950, p95 14 ms |
@@ -362,8 +391,8 @@ from the configuration.
 
 | Requirement | Weight | Where |
 | --- | --- | --- |
-| IaC and environment design | 20% | `infra/terraform/`, sections 5 and 6 |
-| CI/CD quality | 20% | `.github/workflows/`, section 10 |
+| IaC and environment design | 20% | `infra/terraform/`, sections 5, 6 and 10 |
+| CI/CD quality | 20% | `.github/workflows/` (`ci`, `deploy`, `terraform`), section 10 |
 | Observability | 20% | `observability/`, section 9 |
 | Security | 15% | [SECURITY.md](SECURITY.md), section 11 |
 | AI workload readiness | 15% | `worker/`, `scripts/eval.py`, sections 3, 8 and 12 |

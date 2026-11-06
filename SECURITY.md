@@ -64,6 +64,9 @@ the single largest gap between this assignment and production.
 - Images are tagged with both a version and the commit SHA. A deployed revision is always traceable to a commit.
 - The default `GITHUB_TOKEN` is read only. `id-token: write` is granted only because federation requires it.
 - Production deployment waits on a GitHub environment with a required reviewer.
+- No value from an event payload is interpolated into a shell command. Inputs reach the shell through the environment, and the resolved image tag is pattern-checked before a deploy command can use it, so a tag carrying shell metacharacters fails the run instead of executing.
+- Terraform plans on pull requests from forks are skipped, since GitHub withholds the id-token there; `validate`, which needs no credentials, still runs.
+- Infrastructure is applied only by the `terraform` workflow. A daily drift check compares live infrastructure against `main` and opens an issue when they diverge, so a change made by hand in the console cannot quietly become the real configuration.
 
 ### Runtime
 

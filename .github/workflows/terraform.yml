@@ -1,0 +1,335 @@
+name: terraform
+
+# Git is the source of truth for infrastructure.
+#
+#   pull request  -> fmt, validate and plan, with the plan posted on the PR
+#   merge to main -> apply, behind an environment with a required reviewer
+#   schedule      -> detect drift and open an issue when reality has moved
+#
+# Nothing applies infrastructure outside this workflow. A change made by hand
+# in the console is not lost silently: the scheduled run finds it and raises
+# it, which is the property that makes the repository trustworthy as the
+# description of what is actually running.
+
+on:
+  pull_request:
+    paths: ["infra/**", ".github/workflows/terraform.yml"]
+  push:
+    branches: [main]
+    paths: ["infra/**"]
+  schedule:
+    # 02:30 UTC daily, before the working day in ICT.
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  # Never let two runs touch the same state at once. Applies are not
+  # cancelled mid-flight, because a half-applied change is worse than a slow
+  # queue.
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.9.8"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  validate:
+    name: Validate (${{ matrix.env }})
+    runs-on: ubuntu-latest
+    # Needs no cloud credentials, so it also runs on forks.
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [dev, prod]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Format check
+        run: terraform fmt -check -recursive infra/terraform
+
+      - name: Init without backend
+        working-directory: infra/terraform/envs/${{ matrix.env }}
+        run: terraform init -backend=false -input=false
+
+      - name: Validate
+        working-directory: infra/terraform/envs/${{ matrix.env }}
+        run: terraform validate
+
+  plan:
+    name: Plan (${{ matrix.env }})
+    needs: validate
+    # Skipped for pull requests from forks. GitHub withholds the id-token and
+    # write permissions there by design, so the job could only fail; validate
+    # above still runs and is the gate that matters for an external
+    # contribution.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [dev, prod]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_TERRAFORM_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Init
+        working-directory: infra/terraform/envs/${{ matrix.env }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.GCP_TFSTATE_BUCKET }}"
+
+      - name: Plan
+        id: plan
+        working-directory: infra/terraform/envs/${{ matrix.env }}
+        run: |
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=5m \
+            -var "project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var "api_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/api:bootstrap" \
+            -var "worker_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/worker:bootstrap" \
+            -out=tfplan > plan.txt 2>&1
+          code=$?
+          set -e
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 1 ]; then
+            echo "::error::terraform plan failed for ${{ matrix.env }}"
+            tail -50 plan.txt
+            exit 1
+          fi
+          # Keep the comment under GitHub's 65535 character limit.
+          tail -c 60000 plan.txt > plan.trimmed
+
+      - name: Comment the plan on the pull request
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const env = '${{ matrix.env }}';
+            const marker = `<!-- terraform-plan-${env} -->`;
+            const plan = fs.readFileSync(
+              'infra/terraform/envs/' + env + '/plan.trimmed', 'utf8'
+            );
+            const body = [
+              marker,
+              `### Terraform plan - \`${env}\``,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const existing = await github.paginate(
+              github.rest.issues.listComments, { owner, repo, issue_number }
+            );
+            // Update in place so a busy pull request does not collect one
+            // plan comment per push.
+            const previous = existing.find(
+              c => c.body && c.body.includes(marker)
+            );
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: previous.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body,
+              });
+            }
+
+  apply:
+    name: Apply (dev)
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_TERRAFORM_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Init
+        working-directory: infra/terraform/envs/dev
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.GCP_TFSTATE_BUCKET }}"
+
+      - name: Apply
+        working-directory: infra/terraform/envs/dev
+        run: |
+          terraform apply -input=false -auto-approve -lock-timeout=5m \
+            -var "project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var "api_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/api:bootstrap" \
+            -var "worker_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/worker:bootstrap"
+
+  # Prod is a separate job so it can carry a required reviewer of its own.
+  # The dev apply having succeeded is the gate in front of it.
+  apply-prod:
+    name: Apply (prod)
+    needs: apply
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_TERRAFORM_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Init
+        working-directory: infra/terraform/envs/prod
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.GCP_TFSTATE_BUCKET }}"
+
+      - name: Apply
+        working-directory: infra/terraform/envs/prod
+        run: |
+          terraform apply -input=false -auto-approve -lock-timeout=5m \
+            -var "project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var "api_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/api:bootstrap" \
+            -var "worker_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/worker:bootstrap"
+
+  drift:
+    name: Drift detection (${{ matrix.env }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [dev, prod]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_TERRAFORM_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Init
+        working-directory: infra/terraform/envs/${{ matrix.env }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.GCP_TFSTATE_BUCKET }}"
+
+      - name: Plan against reality
+        id: drift
+        working-directory: infra/terraform/envs/${{ matrix.env }}
+        run: |
+          # -detailed-exitcode: 0 no changes, 1 error, 2 changes pending.
+          # Exit code 2 on a scheduled run means live infrastructure no longer
+          # matches the repository.
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=5m \
+            -detailed-exitcode \
+            -var "project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var "api_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/api:bootstrap" \
+            -var "worker_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/worker:bootstrap" \
+            > drift.txt 2>&1
+          code=$?
+          set -e
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          tail -c 50000 drift.txt > drift.trimmed
+          case "$code" in
+            0) echo "no drift in ${{ matrix.env }}" ;;
+            2) echo "::warning::drift detected in ${{ matrix.env }}" ;;
+            *) echo "::error::terraform plan failed"; cat drift.txt; exit 1 ;;
+          esac
+
+      - name: Open or update a drift issue
+        if: steps.drift.outputs.exitcode == '2'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const env = '${{ matrix.env }}';
+            const title = `Infrastructure drift detected in ${env}`;
+            const plan = fs.readFileSync(
+              'infra/terraform/envs/' + env + '/drift.trimmed', 'utf8'
+            );
+            const body = [
+              `Live infrastructure in \`${env}\` no longer matches \`main\`.`,
+              '',
+              'Either the change was intended, in which case put it in the',
+              'repository and merge it, or it was not, in which case re-apply',
+              'from `main` to reconcile.',
+              '',
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              '',
+              '<details><summary>Pending changes</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', labels: 'drift',
+            });
+            // One issue per environment, refreshed, so repeated drift does
+            // not bury the tracker.
+            const existing = open.find(i => i.title === title);
+            if (existing) {
+              await github.rest.issues.update({
+                owner, repo, issue_number: existing.number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner, repo, title, body, labels: ['drift', env],
+              });
+            }

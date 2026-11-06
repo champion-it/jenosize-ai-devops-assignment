@@ -60,6 +60,18 @@ A production hardening step beyond this assignment would be Cloud SQL IAM
 authentication, which removes the password entirely. The database flag is
 already enabled, so the change is additive.
 
+## Change process
+
+Infrastructure is not applied from a laptop. `.github/workflows/terraform.yml`
+plans on every pull request that touches `infra/**` and posts the plan as a
+comment, applies on merge to `main` behind a required reviewer, and runs
+`terraform plan -detailed-exitcode` on a daily schedule. Exit code 2 on that
+scheduled run means live infrastructure has diverged from the repository, and
+the workflow opens a `drift` issue with the pending changes attached.
+
+The commands below remain the way to bootstrap an environment for the first
+time, and the way to investigate locally.
+
 ## Who owns what
 
 The deploy pipeline owns the container image and the traffic split. Terraform
