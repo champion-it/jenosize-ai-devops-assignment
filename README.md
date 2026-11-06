@@ -49,43 +49,11 @@ in a real provider is a configuration change, not a code change - see
 
 ## 3. Architecture
 
-```
-                         Internet
-                             |
-                    [ Cloud Armor / WAF ]
-                  rate limit, SQLi and XSS rules
-                             |
-                 +-----------v------------+
-                 |   Cloud Run: api       |
-                 |   FastAPI, autoscaled  |
-                 |   /healthz /readyz     |
-                 |   /ask /metrics        |
-                 +--+-----------------+---+
-                    |                 |
-         retrieval  |                 |  cache
-                    |                 |
-      +-------------v------+   +------v--------+
-      |  Cloud SQL         |   |  Memorystore  |
-      |  Postgres+pgvector |   |  Redis        |
-      |  private IP only   |   +---------------+
-      +-------------^------+
-                    |
-          writes    |
-                    |
-      +-------------+------------+        +------------------+
-      |  Cloud Run Job: worker   |<-------| Cloud Scheduler  |
-      |  chunk, embed, upsert    |        | nightly reindex  |
-      +-------------^------------+        +------------------+
-                    |
-              +-----+------+
-              |    /data   |
-              |  *.md docs |
-              +------------+
+![Architecture of the Jenie Helpdesk AI platform](docs/architecture.svg)
 
-  Observability: the API exports Prometheus metrics and JSON logs, scraped by
-  Prometheus locally and by Managed Service for Prometheus on GCP. The same
-  dashboards and alert rules apply in both.
-```
+Blue marks the request path that `/ask` depends on. Four concerns are laid out
+separately because they fail separately: delivery, serving, indexing and
+observability.
 
 ### Request path for `POST /ask`
 
