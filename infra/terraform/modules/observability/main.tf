@@ -146,3 +146,69 @@ resource "google_monitoring_alert_policy" "indexing_failed" {
     mime_type = "text/markdown"
   }
 }
+
+# ---------------------------------------------------------------------------
+# SLO burn-rate alerts
+#
+# Cloud Monitoring evaluates PromQL directly against Managed Service for
+# Prometheus, so the objectives defined in docs/slo.md apply in production
+# and not only in docker-compose.
+#
+# slo_alerts.json is generated from observability/alerts/rules.yml by
+# scripts/render_slo_alerts.py, which inlines the recording rules because
+# Cloud Monitoring does not evaluate them. CI re-renders and fails if the
+# committed file is stale, so the YAML stays the single place a threshold is
+# edited and these policies cannot drift away from it.
+# ---------------------------------------------------------------------------
+
+locals {
+  slo_policies = {
+    for policy in jsondecode(file("${path.module}/slo_alerts.json")).policies :
+    policy.name => policy
+  }
+}
+
+resource "google_monitoring_alert_policy" "slo" {
+  for_each = var.enable_slo_alerts ? local.slo_policies : {}
+
+  project      = var.project_id
+  display_name = "Jenie ${var.environment} - ${each.value.summary}"
+  combiner     = "OR"
+  severity     = each.value.severity == "critical" ? "CRITICAL" : "WARNING"
+
+  conditions {
+    display_name = each.key
+
+    condition_prometheus_query_language {
+      query    = each.value.query
+      duration = each.value.duration
+      # Matches the rule group interval in rules.yml, so the two evaluate
+      # the same expression at the same cadence.
+      evaluation_interval = "30s"
+
+      labels = {
+        slo         = each.value.slo
+        pages       = tostring(each.value.pages)
+        environment = var.environment
+      }
+    }
+  }
+
+  notification_channels = [for channel in google_monitoring_notification_channel.email : channel.id]
+
+  documentation {
+    content = join("\n\n", compact([
+      each.value.description,
+      "Objectives and the error budget policy: docs/slo.md",
+      each.value.pages ? "This one pages." : "Raise a ticket; this does not need waking anyone.",
+    ]))
+    mime_type = "text/markdown"
+  }
+
+  # A burn-rate alert that stays open after the burn stops is noise. The
+  # expression already requires a short window to agree, so closing
+  # automatically is safe.
+  alert_strategy {
+    auto_close = "1800s"
+  }
+}

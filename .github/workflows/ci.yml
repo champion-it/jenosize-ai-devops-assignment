@@ -35,6 +35,12 @@ jobs:
       - name: ruff format
         run: ruff format --check .
 
+      - name: SLO alert policies match the Prometheus rules
+        # The generated Cloud Monitoring policies are committed. If the alert
+        # rules changed without re-rendering, the objectives in production
+        # would quietly differ from the ones in the repository.
+        run: python3 scripts/render_slo_alerts.py --check
+
   test:
     name: Unit tests
     runs-on: ubuntu-latest

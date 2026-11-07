@@ -85,6 +85,32 @@ variable "llm_provider" {
   default = "mock"
 }
 
+variable "managed_prometheus" {
+  description = <<-EOT
+    Run an OpenTelemetry Collector sidecar that scrapes the container's
+    /metrics and writes to Managed Service for Prometheus.
+
+    Without it the Prometheus metrics this service exports exist only where
+    a Prometheus is scraping it, which on Cloud Run is nowhere. The SLO
+    recording rules and burn-rate alerts would then be real in
+    docker-compose and absent in production, which is worse than not having
+    written them.
+  EOT
+  type = object({
+    enabled         = bool
+    scrape_interval = string
+    image           = string
+  })
+  default = {
+    enabled = true
+    # 30s rather than 10s: Google's own guidance is that moving from 10s to
+    # 30s cuts sample volume by about two thirds, and the burn-rate windows
+    # here are 5 minutes and longer, so the resolution is not needed.
+    scrape_interval = "30s"
+    image           = "us-docker.pkg.dev/cloud-ops-agents-artifacts/google-cloud-opentelemetry-collector/otelcol-google:0.123.0"
+  }
+}
+
 variable "otel_exporter_otlp_endpoint" {
   description = <<-EOT
     OTLP endpoint for traces. Null means spans are created but not exported,

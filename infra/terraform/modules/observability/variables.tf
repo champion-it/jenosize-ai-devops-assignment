@@ -38,3 +38,13 @@ variable "log_retention_days" {
   type    = number
   default = 30
 }
+
+variable "enable_slo_alerts" {
+  description = <<-EOT
+    Create the burn-rate policies generated from the Prometheus rules. They
+    need Managed Service for Prometheus to be receiving the metrics, which
+    the service module's sidecar provides.
+  EOT
+  type        = bool
+  default     = true
+}

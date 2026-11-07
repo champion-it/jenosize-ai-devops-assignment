@@ -58,6 +58,20 @@ resource "google_cloud_run_v2_service" "api" {
   template {
     service_account = google_service_account.api.email
 
+    dynamic "volumes" {
+      for_each = var.managed_prometheus.enabled ? [1] : []
+      content {
+        name = "otel-config"
+        secret {
+          secret = google_secret_manager_secret.otel_config[0].secret_id
+          items {
+            version = "latest"
+            path    = "config.yaml"
+          }
+        }
+      }
+    }
+
     scaling {
       min_instance_count = var.min_instances
       max_instance_count = var.max_instances
@@ -151,12 +165,51 @@ resource "google_cloud_run_v2_service" "api" {
         failure_threshold     = 10
       }
 
+      dynamic "volume_mounts" {
+        for_each = var.managed_prometheus.enabled ? [1] : []
+        content {
+          name       = "otel-config"
+          mount_path = "/etc/otel"
+        }
+      }
+
       liveness_probe {
         http_get {
           path = "/healthz"
         }
         period_seconds    = 30
         failure_threshold = 3
+      }
+    }
+
+    # Scrapes 127.0.0.1:8000/metrics inside the same instance and writes to
+    # Managed Service for Prometheus. The metric names are unchanged, so the
+    # recording rules and burn-rate alerts in observability/alerts/rules.yml
+    # describe the same series here as they do in docker-compose.
+    dynamic "containers" {
+      for_each = var.managed_prometheus.enabled ? [1] : []
+      content {
+        name    = "otel-sidecar"
+        image   = var.managed_prometheus.image
+        command = ["/otelcol-google"]
+        args    = ["--config=/etc/otel/config.yaml"]
+
+        volume_mounts {
+          name       = "otel-config"
+          mount_path = "/etc/otel"
+        }
+
+        resources {
+          limits = {
+            cpu    = "0.5"
+            memory = "256Mi"
+          }
+        }
+
+        env {
+          name  = "GOOGLE_CLOUD_PROJECT"
+          value = var.project_id
+        }
       }
     }
   }
@@ -285,4 +338,80 @@ resource "google_project_iam_member" "worker_job_runner" {
   project = var.project_id
   role    = "roles/run.invoker"
   member  = "serviceAccount:${google_service_account.worker.email}"
+}
+
+# OpenTelemetry Collector configuration for the metrics sidecar.
+#
+# It scrapes the application container over loopback inside the same Cloud
+# Run instance and writes to Managed Service for Prometheus. Nothing is
+# exposed on the network: the application's /metrics is not reachable from
+# outside the instance.
+#
+# Not a secret, but Cloud Run mounts files from Secret Manager, so this is
+# the mechanism available for getting a config file into a stock image
+# without building one.
+resource "google_secret_manager_secret" "otel_config" {
+  count = var.managed_prometheus.enabled ? 1 : 0
+
+  secret_id = "${var.name_prefix}-otel-config"
+
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "otel_config" {
+  count = var.managed_prometheus.enabled ? 1 : 0
+
+  secret = google_secret_manager_secret.otel_config[0].id
+  secret_data = yamlencode({
+    receivers = {
+      prometheus = {
+        config = {
+          scrape_configs = [{
+            job_name        = "jenie-api"
+            scrape_interval = var.managed_prometheus.scrape_interval
+            metrics_path    = "/metrics"
+            static_configs  = [{ targets = ["127.0.0.1:8000"] }]
+          }]
+        }
+      }
+    }
+    processors = {
+      # Required by the exporter: it needs the resource attributes that
+      # identify which Cloud Run revision the sample came from.
+      resourcedetection = {
+        detectors = ["env", "gcp"]
+        timeout   = "10s"
+      }
+      batch = {
+        send_batch_max_size = 200
+        send_batch_size     = 200
+        timeout             = "5s"
+      }
+    }
+    exporters = {
+      googlemanagedprometheus = {
+        project = var.project_id
+      }
+    }
+    service = {
+      pipelines = {
+        metrics = {
+          receivers  = ["prometheus"]
+          processors = ["resourcedetection", "batch"]
+          exporters  = ["googlemanagedprometheus"]
+        }
+      }
+    }
+  })
+}
+
+# The API service account reads the config, and writes the samples.
+resource "google_secret_manager_secret_iam_member" "otel_config" {
+  count = var.managed_prometheus.enabled ? 1 : 0
+
+  secret_id = google_secret_manager_secret.otel_config[0].id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.api.email}"
 }

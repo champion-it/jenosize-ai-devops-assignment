@@ -126,6 +126,7 @@ attributed to the vector search or to the model without guessing.
 │   ├── eval.py                  retrieval evaluation and CI gate
 │   ├── check_manifests.py       security posture of the rendered chart
 │   ├── dora.py                  delivery metrics from git and the API
+│   ├── render_slo_alerts.py     Prometheus rules into Cloud Monitoring policies
 │   └── eval_queries.json
 ├── .github/workflows/
 │   ├── ci.yml                   lint, test, scan, integration, build, push
@@ -338,6 +339,14 @@ Alert rules in [`observability/alerts/rules.yml`](observability/alerts/rules.yml
 alerts for conditions a user-facing SLI cannot see (`ApiDown`,
 `RetrievalQualityDrop`, `AiCostSpike`).
 
+On GCP the same objectives apply rather than being left behind in
+docker-compose: a collector sidecar writes the service's Prometheus metrics
+to Managed Service for Prometheus, and the alert rules are rendered into
+Cloud Monitoring policies that evaluate the identical PromQL.
+`scripts/render_slo_alerts.py` generates them and CI fails the build if the
+committed output no longer matches the rules, so there is one definition of
+each objective instead of two that drift.
+
 `scripts/dora.py` computes deployment frequency and lead time from the
 repository and workflow history. Change failure rate and time to restore are
 reported as unavailable rather than estimated: both need an incident record
@@ -487,6 +496,7 @@ from the configuration.
 | Check | Result |
 | --- | --- |
 | Unit tests | 47 passed |
+| SLO parity | changing a burn rate makes `render_slo_alerts.py --check` exit non-zero; restoring it passes |
 | Helm chart | lints clean on all three value sets; both environments render and pass the manifest security check |
 | `ruff check` / `ruff format --check` | clean |
 | `terraform validate`, dev and prod | both valid |

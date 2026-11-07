@@ -106,6 +106,38 @@ that will run out in ten days does not need anyone woken up.
 
 Rules: [`observability/alerts/rules.yml`](../observability/alerts/rules.yml).
 
+### The same objectives in production
+
+Prometheus rules only run where a Prometheus is running, which on Cloud Run
+is nowhere. Left alone, these objectives would be real in docker-compose and
+absent in production - the worst of both, because the repository would show
+alerting that does not exist.
+
+Two pieces close that:
+
+1. **The metrics reach Google.** The Cloud Run service runs an OpenTelemetry
+   Collector sidecar that scrapes the application over loopback inside the
+   same instance and writes to Managed Service for Prometheus. Metric names
+   are unchanged, so every expression here describes the same series in both
+   places. The scrape interval is 30s rather than 10s, which cuts sample
+   volume by about two thirds and costs nothing in accuracy when the
+   shortest burn window is five minutes.
+
+2. **The alerts evaluate there.** Cloud Monitoring runs PromQL directly
+   against Managed Service for Prometheus, so the same expressions become
+   alert policies. It does not evaluate recording rules, so
+   `scripts/render_slo_alerts.py` inlines them and writes
+   `infra/terraform/modules/observability/slo_alerts.json`, which Terraform
+   reads.
+
+The generated file is committed and CI re-renders it with `--check`. If a
+threshold changes here without the policies being re-rendered, the build
+fails. That is the mechanism that keeps one definition rather than two that
+drift, and it is tested: changing a burn rate makes the check exit non-zero.
+
+Cost: roughly 99 active series at a 30s scrape is about 10M samples a month.
+Managed Service for Prometheus bills per sample ingested.
+
 ### Two things these expressions get wrong if written naively
 
 Both were found by testing the rules against a running service rather than
