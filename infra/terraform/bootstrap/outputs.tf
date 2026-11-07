@@ -1,24 +1,25 @@
-# These are the values to set as GitHub repository variables. Settings ->
-# Secrets and variables -> Actions -> Variables. None of them is a secret:
-# federation means there is no key to store.
-
+# These become GitHub repository variables. None is a secret: federation
+# means there is no key to store.
 output "github_repository_variables" {
-  description = "Copy these into the repository's Actions variables."
   value = {
-    GCP_PROJECT_ID                = var.project_id
-    GCP_REGION                    = var.region
-    GCP_WIF_PROVIDER              = google_iam_workload_identity_pool_provider.github.name
-    GCP_DEPLOY_SERVICE_ACCOUNT    = google_service_account.deploy.email
-    GCP_TERRAFORM_SERVICE_ACCOUNT = google_service_account.terraform.email
-    GCP_TFSTATE_BUCKET            = google_storage_bucket.state.name
+    AWS_REGION             = var.region
+    AWS_ACCOUNT_ID         = data.aws_caller_identity.current.account_id
+    AWS_DEPLOY_ROLE_ARN    = aws_iam_role.deploy.arn
+    AWS_TERRAFORM_ROLE_ARN = aws_iam_role.terraform.arn
+    TF_STATE_BUCKET        = aws_s3_bucket.state.id
+    TF_STATE_LOCK_TABLE    = aws_dynamodb_table.lock.name
+    ECR_REGISTRY           = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.region}.amazonaws.com"
   }
 }
 
-output "artifact_registry" {
-  description = "Docker registry host and repository path."
-  value       = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.jenie.repository_id}"
+output "ecr_repositories" {
+  value = { for k, repo in aws_ecr_repository.main : k => repo.repository_url }
 }
 
 output "state_bucket" {
-  value = google_storage_bucket.state.name
+  value = aws_s3_bucket.state.id
+}
+
+output "lock_table" {
+  value = aws_dynamodb_table.lock.name
 }

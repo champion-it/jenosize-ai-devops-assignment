@@ -1,0 +1,20 @@
+{{- if .Values.rollout.enabled }}
+# Argo Rollouts points this service at the canary pods only, which is how
+# the analysis measures the new version instead of the average of both.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "jenie.fullname" . }}-api-canary
+  labels:
+    {{- include "jenie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  selector:
+    {{- include "jenie.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+{{- end }}

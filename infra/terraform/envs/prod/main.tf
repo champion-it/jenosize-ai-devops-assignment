@@ -1,83 +1,79 @@
 # Production environment.
 #
-# Differences from dev, all of them deliberate:
-#   - regional database with automatic failover and point in time recovery
-#   - one warm instance so the first request of the day is not a cold start
-#   - Cloud Armor in front of the service
-#   - longer log retention for audit
-#   - deletion protection on the database
+# The cluster, the database instance and the metrics workspace are shared
+# and belong to the cluster root. What is per-environment is the Helm
+# release: this root holds the values that differ and the outputs the
+# release needs, so the two are versioned together rather than one living
+# in a wiki.
+#
+# Deliberately thin. An environment that only parameterises a chart should
+# look like it.
+
+data "terraform_remote_state" "cluster" {
+  backend = "s3"
+  config = {
+    bucket = var.cluster_state.bucket
+    key    = var.cluster_state.key
+    region = var.cluster_state.region
+  }
+}
 
 locals {
   environment = "prod"
-  name_prefix = "jenie-prod"
+  namespace   = "jenie-prod"
 }
 
-module "network" {
-  source = "../../modules/network"
+# The values the Helm release needs, rendered from what the cluster
+# actually created rather than copied by hand into a values file.
+resource "local_file" "helm_values" {
+  filename        = "${path.module}/generated-values.yaml"
+  file_permission = "0644"
 
-  name_prefix = local.name_prefix
-  region      = var.region
-  subnet_cidr = "10.30.0.0/24"
+  content = yamlencode({
+    environment = local.environment
 
-  enable_cloud_armor    = true
-  rate_limit_per_minute = 300
-}
+    namespace = {
+      create = true
+      name   = local.namespace
+    }
 
-module "database" {
-  source = "../../modules/database"
+    image = {
+      registry = data.terraform_remote_state.cluster.outputs.ecr_registry
+      api      = { tag = var.image_tag }
+      worker   = { tag = var.image_tag }
+    }
 
-  name_prefix                = local.name_prefix
-  region                     = var.region
-  network_id                 = module.network.network_id
-  private_service_connection = module.network.private_service_connection
+    serviceAccount = {
+      create = true
+      annotations = {
+        "eks.amazonaws.com/role-arn" = data.terraform_remote_state.cluster.outputs.workload_role_arns["prod"]
+      }
+    }
 
-  tier                   = "db-custom-2-7680"
-  disk_size_gb           = 50
-  highly_available       = true
-  point_in_time_recovery = true
-  retained_backups       = 30
-  backup_location        = "asia"
-  deletion_protection    = true
-}
+    config = {
+      logLevel = "INFO"
+      # Traces go to the collector, which forwards to the tracing backend.
+      otelEndpoint = "http://opentelemetry-collector.monitoring:4318"
+    }
 
-module "service" {
-  source = "../../modules/service"
+    # Progressive delivery, with the canary judged against the service
+    # level indicators rather than a timer. The analysis queries the same
+    # Managed Prometheus workspace the burn-rate alerts evaluate in, so a
+    # release and an alert can never disagree about the error rate.
+    rollout = {
+      enabled = true
+      trafficRouting = {
+        alb = { enabled = true }
+      }
+      analysis = {
+        enabled           = true
+        prometheusAddress = data.terraform_remote_state.cluster.outputs.prometheus_query_base
+      }
+    }
 
-  project_id   = var.project_id
-  name_prefix  = local.name_prefix
-  environment  = local.environment
-  region       = var.region
-  network_name = module.network.network_name
-  subnet_name  = module.network.subnet_id
-
-  api_image    = var.api_image
-  worker_image = var.worker_image
-
-  database_url_secret_id   = module.database.database_url_secret_id
-  database_url_secret_name = module.database.database_url_secret_name
-
-  min_instances         = 1
-  max_instances         = 20
-  memory                = "1Gi"
-  cpu                   = "2"
-  log_level             = "INFO"
-  rate_limit_per_minute = 60
-  otel_sample_ratio     = 0.1
-  allow_unauthenticated = true
-  reindex_schedule      = "0 2 * * *"
-}
-
-module "observability" {
-  source = "../../modules/observability"
-
-  project_id       = var.project_id
-  environment      = local.environment
-  region           = var.region
-  api_service_name = module.service.api_service_name
-  worker_job_name  = module.service.worker_job_name
-  alert_emails     = var.alert_emails
-
-  error_rate_threshold = 0.2
-  latency_threshold_ms = 2000
-  log_retention_days   = 90
+    networkPolicy = {
+      enabled      = true
+      databaseCIDR = data.terraform_remote_state.cluster.outputs.vpc_cidr
+    }
+  })
 }

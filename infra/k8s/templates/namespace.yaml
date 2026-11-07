@@ -6,7 +6,7 @@ metadata:
   labels:
     {{- include "jenie.labels" . | nindent 4 }}
     # Pod Security Admission. The namespace is the security boundary on
-    # Kubernetes, the way a VPC is on Cloud Run: anything admitted here must
+    # Kubernetes, the way a VPC is outside it: anything admitted here must
     # meet this level, including workloads this chart does not own.
     pod-security.kubernetes.io/enforce: {{ .Values.namespace.podSecurityLevel }}
     pod-security.kubernetes.io/enforce-version: latest

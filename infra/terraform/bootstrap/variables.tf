@@ -1,25 +1,20 @@
-variable "project_id" {
-  description = "Target GCP project. Bootstrap does not create the project."
-  type        = string
-}
-
-variable "project_number" {
-  description = "Numeric project number, used by the budget filter."
-  type        = string
-}
-
 variable "region" {
   type    = string
-  default = "asia-southeast1"
+  default = "ap-southeast-1"
+}
+
+variable "name_prefix" {
+  type    = string
+  default = "jenie"
 }
 
 variable "state_bucket_name" {
-  description = "Globally unique. Suggested: <project_id>-tfstate."
+  description = "Globally unique across all of S3. Suggested: jenie-tfstate-<account id>."
   type        = string
 }
 
 variable "github_repository" {
-  description = "owner/name. Only workflows in this repository may federate."
+  description = "owner/name. Only workflows in this repository may assume the CI roles."
   type        = string
 
   validation {
@@ -28,55 +23,38 @@ variable "github_repository" {
   }
 }
 
-variable "deploy_roles" {
-  description = "Roles for the pipeline that builds images and deploys revisions."
-  type        = list(string)
-  default = [
-    "roles/artifactregistry.writer",
-    "roles/run.admin",
-    # Required to deploy a revision that runs as the workload service account.
-    "roles/iam.serviceAccountUser",
-  ]
-}
-
-variable "terraform_roles" {
+variable "terraform_policy_arns" {
   description = <<-EOT
-    Roles for the account that applies infrastructure. Broader than the
-    deploy account by necessity, which is why they are separate identities.
-    roles/editor is avoided on purpose: it grants data access this account
-    never needs.
+    Policies for the role that applies infrastructure. PowerUser plus
+    explicit IAM is narrower than Administrator and wide enough for this
+    stack. A long-lived account would replace it with an enumerated list
+    once the resource set stops changing.
   EOT
   type        = list(string)
-  default = [
-    "roles/artifactregistry.admin",
-    "roles/cloudscheduler.admin",
-    "roles/cloudsql.admin",
-    "roles/compute.networkAdmin",
-    "roles/compute.securityAdmin",
-    "roles/iam.serviceAccountAdmin",
-    "roles/iam.serviceAccountUser",
-    "roles/logging.admin",
-    "roles/monitoring.editor",
-    "roles/resourcemanager.projectIamAdmin",
-    "roles/run.admin",
-    "roles/secretmanager.admin",
-    "roles/servicenetworking.networksAdmin",
-  ]
+  default     = ["arn:aws:iam::aws:policy/PowerUserAccess"]
 }
 
-variable "billing_account" {
-  description = "Billing account id. Leave null to skip the budget."
-  type        = string
-  default     = null
+variable "force_delete_ecr" {
+  description = "Allows terraform destroy to remove repositories that still hold images. Right for a short-lived environment, wrong for a registry anyone depends on."
+  type        = bool
+  default     = true
 }
 
-variable "monthly_budget" {
-  description = "Budget amount per month, in budget_currency."
+variable "monthly_budget_usd" {
+  description = "0 disables the budget. On a cluster that bills hourly, leave it on."
   type        = number
-  default     = 50
+  default     = 100
 }
 
-variable "budget_currency" {
-  type    = string
-  default = "USD"
+variable "budget_alert_emails" {
+  type    = list(string)
+  default = []
+}
+
+variable "tags" {
+  type = map(string)
+  default = {
+    Project   = "jenie-helpdesk-ai"
+    ManagedBy = "terraform"
+  }
 }

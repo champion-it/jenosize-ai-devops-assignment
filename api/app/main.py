@@ -82,9 +82,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        # Cloud Run sends SIGTERM and waits before killing the container.
-        # Closing the pool here drains in-flight queries instead of dropping
-        # them, which is what makes a rolling or canary release clean.
+        # Kubernetes sends SIGTERM and waits out the grace period before
+        # killing the container. Closing the pool here drains in-flight
+        # queries instead of dropping them, which is what makes a rolling or
+        # canary release clean.
         logger.info("service stopping, draining connections")
         database.close()
 
@@ -251,9 +252,9 @@ async def ask(payload: AskRequest, request: Request) -> AskResponse | JSONRespon
 async def ingest() -> JSONResponse:
     """Trigger indexing.
 
-    In GCP the indexer is a Cloud Run Job so a large ingest cannot consume
-    API capacity or be killed by a request timeout. This endpoint reports
-    how to start it rather than doing the work inline.
+    In the cluster the indexer is a CronJob, so a large ingest cannot
+    consume API capacity or be killed by a request timeout. This endpoint
+    exists for local use and for a one-off reindex.
     """
     from worker.indexer.main import index_path
 

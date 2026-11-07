@@ -1,11 +1,18 @@
-output "api_url" {
-  value = module.service.api_url
+output "namespace" {
+  value = local.namespace
 }
 
-output "worker_job_name" {
-  value = module.service.worker_job_name
+output "helm_values_file" {
+  description = "Pass this to helm upgrade with -f. Generated from what the cluster created, so it cannot drift from reality."
+  value       = local_file.helm_values.filename
 }
 
-output "database_instance" {
-  value = module.database.instance_name
+output "helm_command" {
+  value = join(" ", [
+    "helm upgrade --install jenie ../../../k8s",
+    "--namespace", local.namespace,
+    "--create-namespace",
+    "-f", "../../../k8s/values-prod.yaml",
+    "-f", local_file.helm_values.filename,
+  ])
 }

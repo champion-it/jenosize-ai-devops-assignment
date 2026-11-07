@@ -1,5 +1,9 @@
-project_id   = "jenosize-jenie-dev"
-region       = "asia-southeast1"
-api_image    = "asia-southeast1-docker.pkg.dev/jenosize-jenie-dev/jenie/api:bootstrap"
-worker_image = "asia-southeast1-docker.pkg.dev/jenosize-jenie-dev/jenie/worker:bootstrap"
-alert_emails = ["platform@example.com"]
+region = "ap-southeast-1"
+
+cluster_state = {
+  bucket = "jenie-tfstate-123456789012"
+  key    = "jenie/cluster/terraform.tfstate"
+  region = "ap-southeast-1"
+}
+
+image_tag = "bootstrap"

@@ -107,3 +107,61 @@ serviceMonitor:
   # Prometheus Operator scrape config. Off by default, since it needs CRDs.
   enabled: false
   interval: 10s
+
+rollout:
+  # Argo Rollouts replaces the Deployment with a Rollout. Off by default so
+  # the chart still installs on a cluster that does not have the controller,
+  # which includes a plain local cluster.
+  enabled: false
+
+  revisionHistoryLimit: 5
+  # Keep the aborted canary's pods briefly so their logs can be read.
+  abortScaleDownDelaySeconds: 30
+  scaleDownDelaySeconds: 30
+
+  # Traffic is shifted in named fractions, each followed by a pause the
+  # analysis runs through. The pauses are short here because the analysis is
+  # what decides, not the clock; lengthen them where traffic is too thin for
+  # two minutes to be meaningful.
+  steps:
+    - setWeight: 10
+    - pause: { duration: 2m }
+    - setWeight: 25
+    - pause: { duration: 2m }
+    - setWeight: 50
+    - pause: { duration: 5m }
+    - setWeight: 100
+
+  trafficRouting:
+    alb:
+      # Weighted target groups. Requires the AWS Load Balancer Controller
+      # and an Ingress; without it the canary share is approximated by
+      # replica count.
+      enabled: false
+      servicePort: 80
+
+  analysis:
+    enabled: true
+    # Begin measuring from the first weight change rather than at the end.
+    startingStep: 0
+    interval: 30s
+    count: 10
+    failureLimit: 2
+    initialDelay: 60s
+
+    # Where the recorded SLIs live. In-cluster Prometheus locally; the
+    # Managed Prometheus query endpoint on AWS.
+    prometheusAddress: http://prometheus-server.monitoring.svc.cluster.local
+    prometheusHeaders: []
+
+    # Thresholds, expressed as the share of requests that may be bad.
+    #
+    # 0.06 is the 6x burn rate that pages in docs/slo.md. Tying the canary
+    # to the same number means a release is stopped by exactly the condition
+    # that would otherwise have woken someone up, rather than by a second
+    # threshold invented for deployments.
+    maxErrorRatio: 0.06
+    maxSlowRatio: 0.06
+
+    checkRetrievalQuality: true
+    maxEmptyRetrievalRatio: 0.3

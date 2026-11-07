@@ -67,12 +67,17 @@ jobs:
         working-directory: infra/terraform/envs/${{ matrix.env }}
         run: terraform validate
 
-  validate-bootstrap:
-    name: Validate (bootstrap)
+  validate-shared:
+    name: Validate (${{ matrix.root }})
+    strategy:
+      fail-fast: false
+      matrix:
+        root: [bootstrap, cluster]
     runs-on: ubuntu-latest
     # Validated here but never planned or applied by CI. Bootstrap needs
-    # broader permissions than the pipeline identity has, on purpose, and it
-    # keeps its state locally.
+    # broader permissions than the pipeline identity has, on purpose, and
+    # the cluster is applied deliberately because it costs money by the
+    # hour from the moment it exists.
     steps:
       - uses: actions/checkout@v4
 
@@ -82,11 +87,11 @@ jobs:
           terraform_wrapper: false
 
       - name: Init without backend
-        working-directory: infra/terraform/bootstrap
+        working-directory: infra/terraform/${{ matrix.root }}
         run: terraform init -backend=false -input=false
 
       - name: Validate
-        working-directory: infra/terraform/bootstrap
+        working-directory: infra/terraform/${{ matrix.root }}
         run: terraform validate
 
   plan:
@@ -99,7 +104,7 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      vars.GCP_PROJECT_ID != ''
+      vars.AWS_TERRAFORM_ROLE_ARN != ''
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -108,11 +113,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: google-github-actions/auth@v2
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_TERRAFORM_SERVICE_ACCOUNT }}
+          role-to-assume: ${{ vars.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -123,7 +127,10 @@ jobs:
         working-directory: infra/terraform/envs/${{ matrix.env }}
         run: |
           terraform init -input=false \
-            -backend-config="bucket=${{ vars.GCP_TFSTATE_BUCKET }}"
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
 
       - name: Plan
         id: plan
@@ -131,9 +138,6 @@ jobs:
         run: |
           set +e
           terraform plan -input=false -no-color -lock-timeout=5m \
-            -var "project_id=${{ vars.GCP_PROJECT_ID }}" \
-            -var "api_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/api:bootstrap" \
-            -var "worker_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/worker:bootstrap" \
             -out=tfplan > plan.txt 2>&1
           code=$?
           set -e
@@ -198,17 +202,16 @@ jobs:
     # job; no change here is needed.
     if: >-
       github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-      vars.GCP_PROJECT_ID != ''
+      vars.AWS_TERRAFORM_ROLE_ARN != ''
     runs-on: ubuntu-latest
     environment: dev
     steps:
       - uses: actions/checkout@v4
 
-      - uses: google-github-actions/auth@v2
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_TERRAFORM_SERVICE_ACCOUNT }}
+          role-to-assume: ${{ vars.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -219,15 +222,16 @@ jobs:
         working-directory: infra/terraform/envs/dev
         run: |
           terraform init -input=false \
-            -backend-config="bucket=${{ vars.GCP_TFSTATE_BUCKET }}"
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
 
       - name: Apply
         working-directory: infra/terraform/envs/dev
         run: |
           terraform apply -input=false -auto-approve -lock-timeout=5m \
-            -var "project_id=${{ vars.GCP_PROJECT_ID }}" \
-            -var "api_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/api:bootstrap" \
-            -var "worker_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/worker:bootstrap"
+            -var 'cluster_state={bucket="${{ vars.TF_STATE_BUCKET }}",key="jenie/cluster/terraform.tfstate",region="${{ vars.AWS_REGION }}"}'
 
   # Prod is a separate job so it can carry a required reviewer of its own.
   # The dev apply having succeeded is the gate in front of it.
@@ -236,17 +240,16 @@ jobs:
     needs: apply
     if: >-
       github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-      vars.GCP_PROJECT_ID != ''
+      vars.AWS_TERRAFORM_ROLE_ARN != ''
     runs-on: ubuntu-latest
     environment: prod
     steps:
       - uses: actions/checkout@v4
 
-      - uses: google-github-actions/auth@v2
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_TERRAFORM_SERVICE_ACCOUNT }}
+          role-to-assume: ${{ vars.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -257,22 +260,23 @@ jobs:
         working-directory: infra/terraform/envs/prod
         run: |
           terraform init -input=false \
-            -backend-config="bucket=${{ vars.GCP_TFSTATE_BUCKET }}"
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
 
       - name: Apply
         working-directory: infra/terraform/envs/prod
         run: |
           terraform apply -input=false -auto-approve -lock-timeout=5m \
-            -var "project_id=${{ vars.GCP_PROJECT_ID }}" \
-            -var "api_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/api:bootstrap" \
-            -var "worker_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/worker:bootstrap"
+            -var 'cluster_state={bucket="${{ vars.TF_STATE_BUCKET }}",key="jenie/cluster/terraform.tfstate",region="${{ vars.AWS_REGION }}"}'
 
   drift:
     name: Drift detection (${{ matrix.env }})
     if: >-
       (github.event_name == 'schedule' ||
        github.event_name == 'workflow_dispatch') &&
-      vars.GCP_PROJECT_ID != ''
+      vars.AWS_TERRAFORM_ROLE_ARN != ''
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -281,11 +285,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: google-github-actions/auth@v2
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_TERRAFORM_SERVICE_ACCOUNT }}
+          role-to-assume: ${{ vars.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -296,7 +299,10 @@ jobs:
         working-directory: infra/terraform/envs/${{ matrix.env }}
         run: |
           terraform init -input=false \
-            -backend-config="bucket=${{ vars.GCP_TFSTATE_BUCKET }}"
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
 
       - name: Plan against reality
         id: drift
@@ -308,9 +314,6 @@ jobs:
           set +e
           terraform plan -input=false -no-color -lock-timeout=5m \
             -detailed-exitcode \
-            -var "project_id=${{ vars.GCP_PROJECT_ID }}" \
-            -var "api_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/api:bootstrap" \
-            -var "worker_image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/worker:bootstrap" \
             > drift.txt 2>&1
           code=$?
           set -e

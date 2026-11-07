@@ -1,106 +1,115 @@
-# Cloud SQL for PostgreSQL with pgvector.
+# RDS PostgreSQL with pgvector.
 #
-# One managed engine holds both the document metadata and the embeddings.
-# That means one backup, one restore procedure and one private network path
-# to secure, instead of running a separate vector database alongside.
+# One instance holds the metadata and the embeddings, the same reasoning as
+# before: one backup, one restore procedure, one network path to secure.
+# pgvector ships with RDS PostgreSQL 15 and later as an available extension;
+# the application creates it on first connection.
 
-resource "google_sql_database_instance" "main" {
-  name             = "${var.name_prefix}-pg"
-  database_version = "POSTGRES_16"
-  region           = var.region
-
-  # Guard against an accidental terraform destroy taking the data with it.
-  deletion_protection = var.deletion_protection
-
-  settings {
-    tier              = var.tier
-    availability_type = var.highly_available ? "REGIONAL" : "ZONAL"
-    disk_type         = "PD_SSD"
-    disk_size         = var.disk_size_gb
-    disk_autoresize   = true
-
-    backup_configuration {
-      enabled    = true
-      start_time = "17:00" # 00:00 ICT
-      location   = var.backup_location
-
-      # Point in time recovery is what turns a 24 hour RPO into minutes.
-      point_in_time_recovery_enabled = var.point_in_time_recovery
-      transaction_log_retention_days = var.point_in_time_recovery ? 7 : 1
-
-      backup_retention_settings {
-        retained_backups = var.retained_backups
-        retention_unit   = "COUNT"
-      }
-    }
-
-    ip_configuration {
-      # No public IP. The instance is unreachable from the internet.
-      ipv4_enabled                                  = false
-      private_network                               = var.network_id
-      enable_private_path_for_google_cloud_services = true
-      ssl_mode                                      = "ENCRYPTED_ONLY"
-    }
-
-    database_flags {
-      name  = "cloudsql.iam_authentication"
-      value = "on"
-    }
-
-    database_flags {
-      name  = "log_min_duration_statement"
-      value = "1000"
-    }
-
-    insights_config {
-      query_insights_enabled  = true
-      record_application_tags = true
-    }
-
-    maintenance_window {
-      day          = 7
-      hour         = 18
-      update_track = "stable"
-    }
-  }
-
-  depends_on = [var.private_service_connection]
+resource "aws_db_subnet_group" "main" {
+  name       = "${var.name_prefix}-db"
+  subnet_ids = var.subnet_ids
+  tags       = var.tags
 }
 
-resource "google_sql_database" "app" {
-  name     = var.database_name
-  instance = google_sql_database_instance.main.name
+resource "aws_security_group" "database" {
+  name        = "${var.name_prefix}-db"
+  description = "Postgres, reachable only from inside the VPC"
+  vpc_id      = var.vpc_id
+
+  tags = merge(var.tags, { Name = "${var.name_prefix}-db" })
 }
 
-resource "random_password" "app_user" {
-  length           = 32
-  special          = true
+# Ingress is granted to specific security groups, never to a CIDR. A rule
+# that names the cluster's group cannot accidentally widen when a subnet is
+# resized.
+resource "aws_vpc_security_group_ingress_rule" "postgres" {
+  for_each = toset(var.allowed_security_group_ids)
+
+  security_group_id            = aws_security_group.database.id
+  referenced_security_group_id = each.value
+  from_port                    = 5432
+  to_port                      = 5432
+  ip_protocol                  = "tcp"
+  description                  = "Postgres from ${each.value}"
+}
+
+resource "random_password" "main" {
+  length  = 32
+  special = true
+  # RDS rejects these in a master password.
   override_special = "!#$%&*()-_=+[]{}<>:?"
 }
 
-resource "google_sql_user" "app" {
-  name     = var.database_user
-  instance = google_sql_database_instance.main.name
-  password = random_password.app_user.result
-}
+resource "aws_db_instance" "main" {
+  identifier     = "${var.name_prefix}-pg"
+  engine         = "postgres"
+  engine_version = var.engine_version
+  instance_class = var.instance_class
 
-# The connection string exists only in Secret Manager. It is never written
-# into an image, an environment file or the repository.
-resource "google_secret_manager_secret" "database_url" {
-  secret_id = "${var.name_prefix}-database-url"
+  allocated_storage     = var.allocated_storage
+  max_allocated_storage = var.max_allocated_storage
+  storage_type          = "gp3"
+  storage_encrypted     = true
 
-  replication {
-    auto {}
+  db_name  = var.database_name
+  username = var.database_user
+  password = random_password.main.result
+  port     = 5432
+
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.database.id]
+  # No public endpoint. The database is reachable only from the VPC.
+  publicly_accessible = false
+
+  multi_az = var.multi_az
+
+  backup_retention_period = var.backup_retention_days
+  backup_window           = "17:00-18:00" # 00:00-01:00 ICT
+  maintenance_window      = "sun:18:00-sun:19:00"
+  copy_tags_to_snapshot   = true
+
+  # Point in time recovery is what turns a 24 hour RPO into minutes. It is
+  # implied by a backup retention period above zero, stated here for clarity.
+  delete_automated_backups = false
+
+  performance_insights_enabled    = var.performance_insights
+  enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
+
+  auto_minor_version_upgrade = true
+  apply_immediately          = var.apply_immediately
+
+  deletion_protection = var.deletion_protection
+  # A final snapshot on destroy is the right default for prod and pure
+  # friction for a demo environment that is torn down daily.
+  skip_final_snapshot       = var.skip_final_snapshot
+  final_snapshot_identifier = var.skip_final_snapshot ? null : "${var.name_prefix}-final-${formatdate("YYYYMMDDhhmmss", timestamp())}"
+
+  tags = var.tags
+
+  lifecycle {
+    # The snapshot name embeds a timestamp, which would otherwise show as a
+    # change on every plan.
+    ignore_changes = [final_snapshot_identifier]
   }
 }
 
-resource "google_secret_manager_secret_version" "database_url" {
-  secret = google_secret_manager_secret.database_url.id
-  secret_data = format(
-    "postgresql://%s:%s@%s:5432/%s",
-    google_sql_user.app.name,
-    urlencode(random_password.app_user.result),
-    google_sql_database_instance.main.private_ip_address,
-    google_sql_database.app.name,
+# The connection string exists only in Secrets Manager. It is never written
+# into a manifest, an image or the repository.
+resource "aws_secretsmanager_secret" "database_url" {
+  name                    = "${var.name_prefix}/database-url"
+  description             = "Postgres connection string for ${var.name_prefix}"
+  recovery_window_in_days = var.secret_recovery_days
+  tags                    = var.tags
+}
+
+resource "aws_secretsmanager_secret_version" "database_url" {
+  secret_id = aws_secretsmanager_secret.database_url.id
+  secret_string = format(
+    "postgresql://%s:%s@%s:%s/%s",
+    aws_db_instance.main.username,
+    urlencode(random_password.main.result),
+    aws_db_instance.main.address,
+    aws_db_instance.main.port,
+    var.database_name,
   )
 }

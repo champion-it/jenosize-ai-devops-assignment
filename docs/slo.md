@@ -108,53 +108,41 @@ Rules: [`observability/alerts/rules.yml`](../observability/alerts/rules.yml).
 
 ### The same objectives in production
 
-Prometheus rules only run where a Prometheus is running, which on Cloud Run
-is nowhere. Left alone, these objectives would be real in docker-compose and
-absent in production - the worst of both, because the repository would show
-alerting that does not exist.
+Prometheus rules only run where a Prometheus is running. On a managed
+platform that is nowhere by default, which would leave these objectives
+real in docker-compose and absent in production - the worst of both,
+because the repository would show alerting that does not exist.
 
-Two pieces close that:
+Two pieces close that, and on AWS they are simpler than they were:
 
-1. **The metrics reach Google.** The Cloud Run service runs an OpenTelemetry
-   Collector sidecar that scrapes the application over loopback inside the
-   same instance and writes to Managed Service for Prometheus. Metric names
-   are unchanged, so every expression here describes the same series in both
-   places. The scrape interval is 30s rather than 10s, which cuts sample
-   volume by about two thirds and costs nothing in accuracy when the
-   shortest burn window is five minutes.
+1. **The metrics reach the workspace.** Each pod runs an OpenTelemetry
+   Collector sidecar that scrapes the application over loopback and remote
+   writes to Amazon Managed Service for Prometheus. Metric names are
+   unchanged, so every expression here describes the same series in both
+   places.
 
-2. **The alerts evaluate there.** Cloud Monitoring runs PromQL directly
-   against Managed Service for Prometheus, so the same expressions become
-   alert policies. It does not evaluate recording rules, so
-   `scripts/render_slo_alerts.py` inlines them and writes
-   `infra/terraform/modules/observability/slo_alerts.json`, which Terraform
-   reads.
+2. **This file is uploaded verbatim.** Managed Prometheus evaluates
+   recording rules, so `observability/alerts/rules.yml` is ingested as-is by
+   `aws_prometheus_rule_group_namespace`. There is no second copy to drift
+   and no generation step: the file in the repository *is* the production
+   ruleset.
 
-The generated file is committed and CI re-renders it with `--check`. If a
-threshold changes here without the policies being re-rendered, the build
-fails. That is the mechanism that keeps one definition rather than two that
-drift, and it is tested: changing a burn rate makes the check exit non-zero.
+Alerts route through Alertmanager to an SNS topic, split by the `page`
+label the rules already set, so severity is decided in one place.
 
-Cost: roughly 99 active series at a 30s scrape is about 10M samples a month.
-Managed Service for Prometheus bills per sample ingested.
+### The canary reads the same indicators
 
-### Two things these expressions get wrong if written naively
+Argo Rollouts queries this workspace to decide whether each canary step may
+proceed. The thresholds in `infra/k8s/values.yaml` are the 6x burn rate that
+pages here, which means a release is stopped by exactly the condition that
+would otherwise have woken someone up, rather than by a second threshold
+invented for deployments.
 
-Both were found by testing the rules against a running service rather than
-by reading them, and both are the kind of defect that leaves the rule
-reporting `health: ok` while being useless.
+That is the whole argument for progressive delivery over a rolling update:
+a rolling update can be rolled back quickly, but only this decides to.
 
-**An absent series is not zero.** With no 5xx anywhere,
-`sum(rate(http_requests_total{status="5xx"}[5m]))` returns an empty vector,
-not `0`. Dividing an empty vector by anything yields an empty vector, so the
-ratio never exists and the alert can never fire - including during the
-outage it was written for. `or vector(0)` is what turns "no errors" into
-zero instead of nothing.
-
-**`1 - good/total` is 1 when there is no traffic.** Written that way, the
-latency ratio reads as "100% of requests are too slow" during any quiet
-period, and pages at 3am because nobody was using the service. Expressed as
-`slow/total` it is `0` when nothing happened, which is the truth.
+Cost: roughly 99 active series at a 30s scrape is about 10M samples a
+month. Managed Prometheus bills per sample ingested.
 
 ## What is deliberately not an SLO
 

@@ -1,230 +1,288 @@
 # Bootstrap.
 #
-# The things that have to exist before envs/dev or envs/prod can be applied,
-# and that are created once and then left alone: enabled APIs, the state
-# bucket, the image registry, and the federation that lets GitHub Actions
-# authenticate without a key.
+# What must exist before any environment can be applied, and what is created
+# once and then left alone: the state backend, the image registry, and the
+# federation that lets GitHub Actions authenticate without a key.
 #
-# It is separate from the environments for two reasons. It needs broader
-# permissions than a day-to-day apply, so keeping it apart means the
-# pipeline's service account never needs them. And it owns the state bucket
-# the environments use, which a configuration cannot do for itself: this one
-# keeps its state locally and that state is committed nowhere.
+# Separate from the environments because it needs broader permissions than a
+# day-to-day apply, so the pipeline identity never holds them, and because
+# it owns the state bucket the environments use, which a configuration
+# cannot do for itself. Its own state stays local.
 
-locals {
-  # Enabling a service is idempotent, and ordering matters: several resources
-  # below fail with a bare "API not enabled" until these are on.
-  services = [
-    "artifactregistry.googleapis.com",
-    "cloudbilling.googleapis.com",
-    "cloudresourcemanager.googleapis.com",
-    "cloudscheduler.googleapis.com",
-    "compute.googleapis.com",
-    "iam.googleapis.com",
-    "iamcredentials.googleapis.com",
-    "logging.googleapis.com",
-    "monitoring.googleapis.com",
-    "run.googleapis.com",
-    "secretmanager.googleapis.com",
-    "servicenetworking.googleapis.com",
-    "sqladmin.googleapis.com",
-    "sts.googleapis.com",
-  ]
-}
-
-resource "google_project_service" "enabled" {
-  for_each = toset(local.services)
-
-  project = var.project_id
-  service = each.value
-
-  # Leaving an API enabled on destroy is deliberate. Disabling one can break
-  # unrelated resources in the same project that happen to depend on it.
-  disable_on_destroy = false
-}
+data "aws_caller_identity" "current" {}
 
 # ---------------------------------------------------------------------------
 # Terraform state
 # ---------------------------------------------------------------------------
 
-resource "google_storage_bucket" "state" {
-  name     = var.state_bucket_name
-  location = var.region
-  project  = var.project_id
+resource "aws_s3_bucket" "state" {
+  bucket = var.state_bucket_name
+  tags   = var.tags
+}
 
-  # Object versioning is the recovery path for corrupted state: restore the
-  # previous generation of the object.
-  versioning {
-    enabled = true
+resource "aws_s3_bucket_versioning" "state" {
+  bucket = aws_s3_bucket.state.id
+
+  # The recovery path for corrupted state: restore the previous version of
+  # the object.
+  versioning_configuration {
+    status = "Enabled"
   }
+}
 
-  uniform_bucket_level_access = true
-  public_access_prevention    = "enforced"
+resource "aws_s3_bucket_server_side_encryption_configuration" "state" {
+  bucket = aws_s3_bucket.state.id
 
-  # State is small; keeping every version forever is not useful, but keeping
-  # a generous history is. These only ever remove superseded versions.
-  lifecycle_rule {
-    condition {
-      num_newer_versions = 20
-    }
-    action {
-      type = "Delete"
-    }
-  }
-
-  lifecycle_rule {
-    condition {
-      days_since_noncurrent_time = 180
-    }
-    action {
-      type = "Delete"
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
     }
   }
+}
 
-  # A bucket holding state should not be destroyable by a stray apply.
-  force_destroy = false
+resource "aws_s3_bucket_public_access_block" "state" {
+  bucket = aws_s3_bucket.state.id
 
-  depends_on = [google_project_service.enabled]
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "state" {
+  bucket = aws_s3_bucket.state.id
+
+  rule {
+    id     = "expire-old-versions"
+    status = "Enabled"
+
+    filter {}
+
+    # State is small. Keeping a generous history is cheap; keeping it
+    # forever is not useful.
+    noncurrent_version_expiration {
+      noncurrent_days           = 180
+      newer_noncurrent_versions = 20
+    }
+  }
+}
+
+# S3 now supports conditional writes for locking, but DynamoDB remains the
+# path that works across every Terraform version in use.
+resource "aws_dynamodb_table" "lock" {
+  name         = "${var.name_prefix}-tf-lock"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LockID"
+
+  attribute {
+    name = "LockID"
+    type = "S"
+  }
+
+  tags = var.tags
 }
 
 # ---------------------------------------------------------------------------
 # Image registry
 # ---------------------------------------------------------------------------
 
-resource "google_artifact_registry_repository" "jenie" {
-  repository_id = "jenie"
-  location      = var.region
-  project       = var.project_id
-  format        = "DOCKER"
-  description   = "Jenie Helpdesk AI service images"
+resource "aws_ecr_repository" "main" {
+  for_each = toset(["api", "worker"])
 
-  docker_config {
-    immutable_tags = false
+  name                 = "${var.name_prefix}/${each.value}"
+  image_tag_mutability = "MUTABLE"
+  force_delete         = var.force_delete_ecr
+
+  image_scanning_configuration {
+    # Every push is scanned. A vulnerable image that reaches the registry is
+    # still caught, even if CI's own scan were skipped.
+    scan_on_push = true
   }
 
-  # Untagged layers accumulate on every rebuild and are pure cost. Tagged
-  # images are kept so a rollback target is always present.
-  cleanup_policies {
-    id     = "delete-untagged"
-    action = "DELETE"
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+
+  tags = var.tags
+}
+
+resource "aws_ecr_lifecycle_policy" "main" {
+  for_each = aws_ecr_repository.main
+
+  repository = each.value.name
+
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Untagged layers accumulate on every build and are pure cost"
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 7
+        }
+        action = { type = "expire" }
+      },
+      {
+        rulePriority = 2
+        description  = "Keep enough tagged images that a rollback target always exists"
+        selection = {
+          tagStatus     = "tagged"
+          tagPrefixList = ["sha-", "v"]
+          countType     = "imageCountMoreThan"
+          countNumber   = 20
+        }
+        action = { type = "expire" }
+      },
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# GitHub Actions federation
+# ---------------------------------------------------------------------------
+
+resource "aws_iam_openid_connect_provider" "github" {
+  url            = "https://token.actions.githubusercontent.com"
+  client_id_list = ["sts.amazonaws.com"]
+  # AWS verifies GitHub's certificate chain itself; the thumbprint is
+  # retained for older API behaviour.
+  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+  tags            = var.tags
+}
+
+data "aws_iam_policy_document" "github_trust" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.github.arn]
+    }
+
     condition {
-      tag_state  = "UNTAGGED"
-      older_than = "604800s" # 7 days
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    # Pinned to one repository. Without this condition the provider trusts
+    # every repository on GitHub and any workflow anywhere could assume
+    # these roles. This is the single most important line in the file.
+    condition {
+      test     = "StringLike"
+      variable = "token.actions.githubusercontent.com:sub"
+      values   = ["repo:${var.github_repository}:*"]
     }
   }
+}
 
-  cleanup_policies {
-    id     = "keep-recent-tagged"
-    action = "KEEP"
-    most_recent_versions {
-      keep_count = 20
-    }
+# Two identities, deliberately. The deploy role can push images and change
+# workloads; the terraform role can change infrastructure. A compromise of
+# the build pipeline therefore cannot rewrite the network or the IAM policy.
+resource "aws_iam_role" "deploy" {
+  name               = "${var.name_prefix}-deploy"
+  assume_role_policy = data.aws_iam_policy_document.github_trust.json
+  tags               = var.tags
+}
+
+resource "aws_iam_role" "terraform" {
+  name               = "${var.name_prefix}-terraform"
+  assume_role_policy = data.aws_iam_policy_document.github_trust.json
+  tags               = var.tags
+}
+
+data "aws_iam_policy_document" "deploy" {
+  statement {
+    sid       = "EcrAuth"
+    effect    = "Allow"
+    actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"]
   }
 
-  depends_on = [google_project_service.enabled]
-}
-
-# ---------------------------------------------------------------------------
-# Workload Identity Federation for GitHub Actions
-# ---------------------------------------------------------------------------
-
-resource "google_iam_workload_identity_pool" "github" {
-  workload_identity_pool_id = "github-pool"
-  display_name              = "GitHub Actions"
-  description               = "Federated identity for CI, so no service account key exists"
-  project                   = var.project_id
-
-  depends_on = [google_project_service.enabled]
-}
-
-resource "google_iam_workload_identity_pool_provider" "github" {
-  workload_identity_pool_id          = google_iam_workload_identity_pool.github.workload_identity_pool_id
-  workload_identity_pool_provider_id = "github-provider"
-  display_name                       = "GitHub OIDC"
-  project                            = var.project_id
-
-  attribute_mapping = {
-    "google.subject"       = "assertion.sub"
-    "attribute.repository" = "assertion.repository"
-    "attribute.ref"        = "assertion.ref"
+  statement {
+    sid    = "EcrPush"
+    effect = "Allow"
+    actions = [
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:CompleteLayerUpload",
+      "ecr:InitiateLayerUpload",
+      "ecr:PutImage",
+      "ecr:UploadLayerPart",
+      "ecr:BatchGetImage",
+      "ecr:DescribeImages",
+    ]
+    resources = [for repo in aws_ecr_repository.main : repo.arn]
   }
 
-  # Without this condition the provider trusts every repository on GitHub,
-  # and any workflow anywhere could mint a token for this project. Scoping it
-  # to one repository is the control that makes federation safe.
-  attribute_condition = "assertion.repository == \"${var.github_repository}\""
-
-  oidc {
-    issuer_uri = "https://token.actions.githubusercontent.com"
+  statement {
+    sid       = "DescribeClusterForKubeconfig"
+    effect    = "Allow"
+    actions   = ["eks:DescribeCluster"]
+    resources = ["*"]
   }
 }
 
-# ---------------------------------------------------------------------------
-# Service accounts used by CI
-# ---------------------------------------------------------------------------
-
-# Builds and deploys. Narrow: it may push images and manage Cloud Run, and
-# nothing else.
-resource "google_service_account" "deploy" {
-  account_id   = "jenie-deploy"
-  display_name = "Jenie deploy pipeline"
-  project      = var.project_id
-
-  depends_on = [google_project_service.enabled]
+resource "aws_iam_role_policy" "deploy" {
+  name   = "deploy"
+  role   = aws_iam_role.deploy.id
+  policy = data.aws_iam_policy_document.deploy.json
 }
 
-# Applies infrastructure. Broader by necessity, which is exactly why it is a
-# different identity from the deploy account.
-resource "google_service_account" "terraform" {
-  account_id   = "jenie-terraform"
-  display_name = "Jenie Terraform"
-  project      = var.project_id
+# Broader by necessity, which is exactly why it is a different identity.
+# PowerUserAccess plus IAM is narrower than Administrator and wide enough to
+# manage this stack; a production account would replace it with an explicit
+# list once the resource set has stopped changing.
+resource "aws_iam_role_policy_attachment" "terraform" {
+  for_each = toset(var.terraform_policy_arns)
 
-  depends_on = [google_project_service.enabled]
+  role       = aws_iam_role.terraform.name
+  policy_arn = each.value
 }
 
-resource "google_project_iam_member" "deploy" {
-  for_each = toset(var.deploy_roles)
+resource "aws_iam_role_policy" "terraform_iam" {
+  name = "manage-iam"
+  role = aws_iam_role.terraform.id
 
-  project = var.project_id
-  role    = each.value
-  member  = "serviceAccount:${google_service_account.deploy.email}"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "iam:*Role*", "iam:*Policy*", "iam:*InstanceProfile*",
+        "iam:*OpenIDConnectProvider*", "iam:TagRole", "iam:UntagRole",
+      ]
+      Resource = "*"
+    }]
+  })
 }
 
-resource "google_project_iam_member" "terraform" {
-  for_each = toset(var.terraform_roles)
+resource "aws_iam_role_policy" "terraform_state" {
+  name = "terraform-state"
+  role = aws_iam_role.terraform.id
 
-  project = var.project_id
-  role    = each.value
-  member  = "serviceAccount:${google_service_account.terraform.email}"
-}
-
-resource "google_storage_bucket_iam_member" "terraform_state" {
-  bucket = google_storage_bucket.state.name
-  role   = "roles/storage.objectAdmin"
-  member = "serviceAccount:${google_service_account.terraform.email}"
-}
-
-# Only workflows running in this repository may impersonate these accounts.
-locals {
-  github_principal = join("", [
-    "principalSet://iam.googleapis.com/",
-    google_iam_workload_identity_pool.github.name,
-    "/attribute.repository/",
-    var.github_repository,
-  ])
-}
-
-resource "google_service_account_iam_member" "deploy_federated" {
-  service_account_id = google_service_account.deploy.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = local.github_principal
-}
-
-resource "google_service_account_iam_member" "terraform_federated" {
-  service_account_id = google_service_account.terraform.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = local.github_principal
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket", "s3:GetBucketVersioning"]
+        Resource = aws_s3_bucket.state.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+        Resource = "${aws_s3_bucket.state.arn}/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"]
+        Resource = aws_dynamodb_table.lock.arn
+      },
+    ]
+  })
 }
 
 # ---------------------------------------------------------------------------
@@ -232,37 +290,37 @@ resource "google_service_account_iam_member" "terraform_federated" {
 # ---------------------------------------------------------------------------
 
 # A budget does not cap spend; it makes spend visible before the invoice
-# does. Worth having from the first day on a project that can autoscale.
-resource "google_billing_budget" "project" {
-  count = var.billing_account == null ? 0 : 1
+# does. On a cluster whose control plane bills by the hour, that matters
+# from day one.
+resource "aws_budgets_budget" "monthly" {
+  count = var.monthly_budget_usd > 0 ? 1 : 0
 
-  billing_account = var.billing_account
-  display_name    = "Jenie ${var.project_id}"
+  name         = "${var.name_prefix}-monthly"
+  budget_type  = "COST"
+  limit_amount = tostring(var.monthly_budget_usd)
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
 
-  budget_filter {
-    projects = ["projects/${var.project_number}"]
-  }
-
-  amount {
-    specified_amount {
-      currency_code = var.budget_currency
-      units         = tostring(var.monthly_budget)
-    }
-  }
-
-  dynamic "threshold_rules" {
-    for_each = [0.5, 0.8, 1.0]
+  dynamic "notification" {
+    for_each = var.budget_alert_emails == [] ? [] : [50, 80, 100]
     content {
-      threshold_percent = threshold_rules.value
-      spend_basis       = "CURRENT_SPEND"
+      comparison_operator        = "GREATER_THAN"
+      threshold                  = notification.value
+      threshold_type             = "PERCENTAGE"
+      notification_type          = "ACTUAL"
+      subscriber_email_addresses = var.budget_alert_emails
     }
   }
 
   # Forecast catches a runaway before the money is actually gone.
-  threshold_rules {
-    threshold_percent = 1.0
-    spend_basis       = "FORECASTED_SPEND"
+  dynamic "notification" {
+    for_each = var.budget_alert_emails == [] ? [] : [100]
+    content {
+      comparison_operator        = "GREATER_THAN"
+      threshold                  = notification.value
+      threshold_type             = "PERCENTAGE"
+      notification_type          = "FORECASTED"
+      subscriber_email_addresses = var.budget_alert_emails
+    }
   }
-
-  depends_on = [google_project_service.enabled]
 }

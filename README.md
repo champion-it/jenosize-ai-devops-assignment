@@ -101,12 +101,14 @@ attributed to the vector search or to the model without guessing.
 │   └── tests/
 ├── infra/
 │   └── terraform/
-│       ├── bootstrap/       APIs, state bucket, registry, WIF, CI identities
+│       ├── bootstrap/       state backend, ECR, GitHub OIDC, CI roles, budget
+│       ├── cluster/         VPC, EKS, RDS, Managed Prometheus, Argo Rollouts
 │       ├── modules/
-│       │   ├── network/         VPC, private service access, Cloud Armor
-│       │   ├── database/        Cloud SQL, backups, DATABASE_URL secret
-│       │   ├── service/         Cloud Run service and job, service accounts
-│       │   └── observability/   alert policies, log sink, log-based metrics
+│       │   ├── network/         VPC, subnets, NAT, flow logs
+│       │   ├── eks/             cluster, Fargate profiles, OIDC provider
+│       │   ├── database/        RDS Postgres with pgvector, Secrets Manager
+│       │   ├── irsa/            one IAM role bound to one service account
+│       │   └── observability/
 │       ├── envs/dev/
 │       ├── envs/prod/
 │       └── README.md            state, ownership, DR and backup strategy
@@ -126,7 +128,6 @@ attributed to the vector search or to the model without guessing.
 │   ├── eval.py                  retrieval evaluation and CI gate
 │   ├── check_manifests.py       security posture of the rendered chart
 │   ├── dora.py                  delivery metrics from git and the API
-│   ├── render_slo_alerts.py     Prometheus rules into Cloud Monitoring policies
 │   └── eval_queries.json
 ├── .github/workflows/
 │   ├── ci.yml                   lint, test, scan, integration, build, push
@@ -146,15 +147,15 @@ vendoring it twice.
 
 | Area | Choice | Reason |
 | --- | --- | --- |
-| Cloud | Google Cloud | The assignment accepts GCP. Cloud Run gives request-based autoscaling, scale to zero, and traffic splitting for canary releases without running a cluster. |
-| IaC | Terraform | Preferred by the assignment. The same modules build both environments, which differ only in the values they pass. |
-| Compute | Cloud Run service + Cloud Run Job | The API is request-driven, the indexer is batch. Separating them means a large ingest cannot consume API capacity or hit a request timeout. |
-| Vector store | Cloud SQL Postgres with pgvector | One managed engine for metadata and vectors: one backup, one restore procedure, one network path to secure. |
+| Cloud | AWS | The assignment names AWS as preferred. |
+| IaC | Terraform | Named as preferred by the assignment. The same modules build both environments, which differ only in the values they pass. |
+| Compute | EKS on Fargate | No node group to size, patch or drain, and billing is per pod rather than per idle instance. The control plane bills hourly regardless, which is the standing cost of this path. |
+| Vector store | RDS PostgreSQL with pgvector | One managed engine for metadata and vectors: one backup, one restore procedure, one network path to secure. |
 | Vector index | HNSW | IVFFlat computes its centroids when the index is built. Built on an empty table it returns no rows at all until rebuilt. HNSW builds incrementally and is correct from empty onwards. |
-| CI/CD | GitHub Actions with Workload Identity Federation | No long-lived service account key in the repository or in GitHub secrets. |
-| Registry | Artifact Registry | Native to GCP, integrates with Cloud Run and vulnerability scanning. |
-| Metrics | `prometheus-client`, Prometheus exposition format | Identical in docker-compose and on Cloud Run via Managed Service for Prometheus. Portable, not tied to one vendor. |
-| Secrets | Secret Manager, mounted by reference at runtime | Secrets never enter an image or the repository. |
+| CI/CD | GitHub Actions with OIDC | The workflow exchanges its GitHub token for short-lived AWS credentials. No access key exists in the repository or in GitHub secrets. |
+| Registry | ECR | Scans on push, so a vulnerable image is caught even if the pipeline's own scan were removed. |
+| Metrics | `prometheus-client`, Prometheus exposition format | Identical in docker-compose and on EKS via Amazon Managed Prometheus. Portable, not tied to one vendor. |
+| Secrets | Secrets Manager, read through an IAM role bound to the service account | Secrets never enter an image, a manifest or the repository. |
 
 On AWS the mapping is ECS Fargate, RDS Postgres with pgvector, ECR and Secrets
 Manager. The application code does not change; only the `infra` module
@@ -170,19 +171,18 @@ same way the Terraform environments do.
 
 Task 1 says "Choose one" between Terraform, Kubernetes manifests/Helm and
 Pulumi. Terraform is the chosen one and covers all four of the task's "Must
-include" items. The chart covers them as well - Namespace with Pod Security
-Admission at `restricted` as the k8s-side security baseline, ExternalSecret
-for the credential, and a DR section - so the Kubernetes path stands on its
-own rather than only as an illustration.
+include" items; the chart covers them as well, with a Namespace carrying Pod
+Security Admission at `restricted` as the cluster-side security baseline, an
+ExternalSecret for the credential, and a DR section.
 
-It is a secondary artifact, not the deployment path. CI lints and renders it
+This is what `deploy.yml` installs. Dev gets a Deployment with a rolling
+update, because a canary on one replica measures nothing. Prod gets an Argo
+Rollouts canary - see section 10.
+
+CI lints the chart against all three value sets, renders both environments
 and checks the rendered manifests still run as non-root with limits, dropped
-capabilities and no credential as a literal, so it cannot rot, but no
-pipeline installs it and it has not been applied to a live cluster.
-
-The thing it cannot match is the release strategy. Canary on Kubernetes needs
-Argo Rollouts or a service mesh; on Cloud Run it is one `update-traffic`
-flag. That gap is a large part of why Cloud Run is the primary path.
+capabilities and no credential as a literal. `helm lint` checks none of
+that, and it is exactly what a later edit would quietly drop.
 
 ---
 
@@ -192,20 +192,20 @@ Two environments built from the same modules.
 
 | | dev | prod |
 | --- | --- | --- |
-| Cloud SQL | `db-custom-1-3840`, zonal | `db-custom-2-7680`, regional with failover |
+| RDS | `db.t4g.micro`, single-AZ | larger class, multi-AZ with failover |
 | Backups | daily, 7 retained | daily, 30 retained, point-in-time recovery |
 | Min instances | 0, scales to zero | 1, avoids a cold start on the first request |
-| Edge | direct, so CI can smoke test it | Cloud Armor |
+| Edge | port forward from CI | ALB with AWS WAF |
 | Log retention | 14 days | 90 days |
 | Deletion protection | off | on |
-| Release | deploy takes all traffic | canary at 10 percent, then promote |
+| Release | Deployment, rolling update | Argo Rollouts canary, aborted by the SLO analysis |
 
 Terraform state lives in a versioned GCS bucket, one prefix per environment.
 See [`infra/terraform/README.md`](infra/terraform/README.md).
 
 `infra/terraform/bootstrap` holds what has to exist before either environment
-can be applied: enabled APIs, the state bucket, the Artifact Registry
-repository, the GitHub federation and the two CI service accounts. It is
+can be applied: the state backend, the ECR repositories, the GitHub OIDC
+provider and the two CI roles. It is
 applied once by a human and keeps its state locally, because a configuration
 cannot keep state in a bucket it is also creating.
 
@@ -222,7 +222,7 @@ everything the service itself needs to run safely in a project is present.
 | --- | --- | --- |
 | GET | `/healthz` | Liveness. Does not touch dependencies, so a database blip cannot restart healthy instances. |
 | GET | `/readyz` | Readiness. Verifies database connectivity so traffic is held during startup. |
-| POST | `/ingest` | Runs an indexing pass. In GCP the indexer normally runs as a Cloud Run Job instead. |
+| POST | `/ingest` | Runs an indexing pass. In the cluster the indexer runs as a CronJob instead. |
 | POST | `/ask` | Answers a query from the knowledge base. |
 | GET | `/metrics` | Prometheus exposition. |
 
@@ -313,9 +313,9 @@ cannot stop the service from starting.
 `/metrics`, `/healthz` and `/readyz` are excluded from tracing: they are
 scraped and polled constantly and would bury the spans that matter.
 
-Locally the collector is Jaeger. On GCP, `otel_exporter_otlp_endpoint` points
-at an OpenTelemetry Collector forwarding to Cloud Trace; the collector is
-deliberately not part of the service module, so the backend is not baked in.
+Locally the collector is Jaeger. In the cluster, `config.otelEndpoint`
+points at a collector in the monitoring namespace; the backend behind it is
+not baked into the service.
 Dev samples everything, prod samples 10 percent, and sampling is
 `ParentBased`, so a sampled trace is never missing its middle.
 
@@ -339,13 +339,16 @@ Alert rules in [`observability/alerts/rules.yml`](observability/alerts/rules.yml
 alerts for conditions a user-facing SLI cannot see (`ApiDown`,
 `RetrievalQualityDrop`, `AiCostSpike`).
 
-On GCP the same objectives apply rather than being left behind in
-docker-compose: a collector sidecar writes the service's Prometheus metrics
-to Managed Service for Prometheus, and the alert rules are rendered into
-Cloud Monitoring policies that evaluate the identical PromQL.
-`scripts/render_slo_alerts.py` generates them and CI fails the build if the
-committed output no longer matches the rules, so there is one definition of
-each objective instead of two that drift.
+In the cluster the same objectives apply rather than being left behind in
+docker-compose. A collector sidecar remote writes the service's Prometheus
+metrics to Amazon Managed Prometheus, and `observability/alerts/rules.yml`
+is uploaded to it verbatim: Managed Prometheus evaluates recording rules, so
+the file in this repository *is* the production ruleset. There is no second
+copy and no generation step to keep in sync.
+
+Argo Rollouts queries that same workspace to decide whether a canary may
+proceed, which is what connects the release strategy to the objectives
+rather than to a timer.
 
 `scripts/dora.py` computes deployment frequency and lead time from the
 repository and workflow history. Change failure rate and time to restore are
@@ -399,14 +402,19 @@ not just for code:
 | Merge to `main` | `apply` to dev, then to prod behind a required reviewer |
 | Daily schedule | `plan -detailed-exitcode` against live infrastructure; exit code 2 means reality has diverged, and the run opens or refreshes a `drift` issue with the pending changes |
 
-This is the part of GitOps that applies without a cluster: every change
-arrives through a reviewed pull request with the plan visible before merge,
-and a change made by hand in the console is surfaced the next morning instead
-of silently becoming the real configuration. A pull-based reconciler such as
-Argo CD or Flux would add automatic correction, but both need Kubernetes to
-run in, which is the trade Cloud Run was chosen to avoid.
+Every infrastructure change arrives through a reviewed pull request with the
+plan visible before merge, and a change made by hand in the console is
+surfaced the next morning instead of silently becoming the real
+configuration.
 
-Jobs that need Google Cloud are guarded on `vars.GCP_PROJECT_ID`. Until the
+Workloads are pushed rather than reconciled. A pull-based reconciler such as
+Argo CD would close that gap for the chart as well, and the cluster already
+runs an Argo controller, so adding it is a smaller step than it looks. It is
+not here because the assignment does not ask for it and because one more
+always-on component on a cluster that already bills hourly needs a better
+reason than symmetry.
+
+Jobs that need AWS are guarded on `vars.AWS_DEPLOY_ROLE_ARN`. Until the
 repository variables from `bootstrap` are set, those jobs skip and the
 pipeline is green on lint, tests, scanning, the integration evaluation and
 `terraform validate`. Setting the variables activates deployment and drift
@@ -428,11 +436,11 @@ the resolved image tag is pattern-checked before it reaches a deploy command.
 Full detail, including the gaps that were accepted and why, is in
 [SECURITY.md](SECURITY.md). Summary:
 
-- No secrets in the repository; Secret Manager at runtime, Trivy secret scanning in CI.
-- Workload Identity Federation for CI, so no static cloud credential exists.
+- No secrets in the repository; Secrets Manager at runtime, Trivy secret scanning in CI.
+- GitHub OIDC for CI, pinned to this repository, so no static cloud credential exists.
 - One least-privilege service account per workload.
-- Cloud SQL on private IP only, VPC denies ingress by default, flow logs on.
-- Cloud Armor rate limiting plus SQLi and XSS rule sets, with an in-process limiter as the fallback.
+- RDS in private subnets with no public endpoint, admitting only the cluster's security group; VPC flow logs on.
+- AWS WAF rate limiting plus the managed common and SQL injection rule sets, with an in-process limiter as the fallback.
 - Containers run as a non-root user with a read-only root filesystem and all capabilities dropped.
 
 The largest gap, stated plainly: there is no end-user authentication or
@@ -477,10 +485,10 @@ A semantic embedding provider gives a better separated distribution.
 | Concern | Approach |
 | --- | --- |
 | Database loss | Daily backups; point-in-time recovery in prod. Prod RPO under 5 minutes, dev 24 hours. |
-| Zone loss | Regional Cloud SQL in prod with automatic failover. |
+| Zone loss | Multi-AZ RDS in prod with automatic failover. |
 | Region loss | Backups replicated to a multi-region location; restore and re-apply with a new region. |
 | Index corruption | The index is derived data. Rerun the worker against `/data`; it is idempotent and rebuilds with `--force`. |
-| Bad release | Cloud Run retains revisions. Rollback is a traffic shift, not a rebuild. |
+| Bad release | Argo Rollouts aborts the canary itself on an SLO breach and shifts traffic back to the stable ReplicaSet. Seconds, no rebuild. |
 | State corruption | GCS object versioning on the Terraform state bucket. |
 
 Detail and the intended restore drill are in
@@ -496,10 +504,11 @@ from the configuration.
 | Check | Result |
 | --- | --- |
 | Unit tests | 47 passed |
-| SLO parity | changing a burn rate makes `render_slo_alerts.py --check` exit non-zero; restoring it passes |
+| Helm render | dev renders a Deployment, prod renders a Rollout with its AnalysisTemplate and canary Service |
+| SLO rules | the same `rules.yml` is evaluated locally by Prometheus and in production by Managed Prometheus, uploaded verbatim |
 | Helm chart | lints clean on all three value sets; both environments render and pass the manifest security check |
 | `ruff check` / `ruff format --check` | clean |
-| `terraform validate`, dev and prod | both valid |
+| `terraform validate` | all four roots valid: bootstrap, cluster, dev, prod |
 | Workflow YAML, all three | valid; no event payload reaches a shell command |
 | `terraform fmt -check -recursive` | clean |
 | Ingest | 12 documents, 45 chunks, 79 ms |

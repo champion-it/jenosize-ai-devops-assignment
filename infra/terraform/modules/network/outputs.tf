@@ -1,20 +1,15 @@
-output "network_id" {
-  value = google_compute_network.main.id
+output "vpc_id" {
+  value = aws_vpc.main.id
 }
 
-output "network_name" {
-  value = google_compute_network.main.name
+output "vpc_cidr" {
+  value = aws_vpc.main.cidr_block
 }
 
-output "subnet_id" {
-  value = google_compute_subnetwork.main.id
+output "public_subnet_ids" {
+  value = aws_subnet.public[*].id
 }
 
-output "private_service_connection" {
-  description = "Depend on this so Cloud SQL is not created before peering."
-  value       = google_service_networking_connection.private_service_access.id
-}
-
-output "security_policy_id" {
-  value = var.enable_cloud_armor ? google_compute_security_policy.edge[0].id : null
+output "private_subnet_ids" {
+  value = aws_subnet.private[*].id
 }

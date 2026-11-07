@@ -1,254 +1,256 @@
 # Deployment checklist
 
-From an empty Google Cloud project to a running service, in order. Each phase
-ends with a check that proves it worked, so a failure is caught where it
+From an empty AWS account to a running service, in order. Each phase ends
+with a command that proves it worked, so a failure is caught where it
 happened rather than three steps later.
 
-Set these once and reuse them in the commands below.
+> **Read the cost note first.** This platform does not scale to zero. The
+> EKS control plane alone is about $73 a month from the moment it exists,
+> and the whole stack is roughly $155. Phase 7 is how you stop it.
 
 ```bash
-export PROJECT_ID="jenosize-jenie"          # your project
-export REGION="asia-southeast1"             # Singapore, closest to Thailand
+export AWS_REGION="ap-southeast-1"
 export REPO="champion-it/jenosize-ai-devops-assignment-yodthong"
-export REGISTRY="${REGION}-docker.pkg.dev/${PROJECT_ID}/jenie"
+export ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+export ECR="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/jenie"
 ```
 
 ---
 
 ## Phase 0 - Prerequisites
 
-- [ ] `gcloud` installed and logged in
+- [ ] `aws` CLI installed and configured
 
-      gcloud auth login
-      gcloud config set project "$PROJECT_ID"
+      brew install awscli
+      aws configure          # access key, secret, region
+      aws sts get-caller-identity
 
-- [ ] Application default credentials for Terraform
+- [ ] `terraform` >= 1.9, `kubectl`, `helm`, `docker`
 
-      gcloud auth application-default login
+- [ ] The Argo Rollouts kubectl plugin, for watching a canary
 
-- [ ] Billing is enabled on the project
+      brew install argoproj/tap/kubectl-argo-rollouts
 
-      gcloud billing projects describe "$PROJECT_ID"
-
-- [ ] `terraform` >= 1.9, `docker`, and optionally `gh`
-
-**Check:** `gcloud config get-value project` prints your project id.
+**Check:** `aws sts get-caller-identity` prints your account id.
 
 ---
 
 ## Phase 1 - Bootstrap
 
-Creates the things the environments depend on but cannot create: enabled
-APIs, the state bucket, the image registry, the GitHub federation and the two
-CI service accounts.
-
-- [ ] Collect the project number and billing account
-
-      gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)'
-      gcloud billing accounts list
-
-- [ ] Fill in the variables
-
-      cd infra/terraform/bootstrap
-      cp terraform.tfvars.example terraform.tfvars
-      # project_id, project_number, region, state_bucket_name, github_repository
-      # state_bucket_name must be globally unique: <project_id>-tfstate works.
-
-- [ ] Apply
-
-      terraform init
-      terraform apply
-
-**Check:** all four exist.
+Creates the state backend, the image registry, the GitHub OIDC provider and
+the two CI roles.
 
 ```bash
-gcloud artifacts repositories describe jenie --location="$REGION"
-gcloud iam workload-identity-pools describe github-pool --location=global
-gcloud storage buckets describe "gs://${PROJECT_ID}-tfstate"
-gcloud iam service-accounts list --filter='email ~ jenie-'
+cd infra/terraform/bootstrap
+cp terraform.tfvars.example terraform.tfvars
+# state_bucket_name must be globally unique across all of S3
+terraform init
+terraform apply
 ```
 
-> The federation provider is restricted to one repository by an attribute
-> condition. If you forked or renamed the repository, change
-> `github_repository` and re-apply, or CI will be refused a token.
+**Check:**
+
+```bash
+aws s3api head-bucket --bucket "$(terraform output -raw state_bucket)"
+aws ecr describe-repositories --repository-names jenie/api jenie/worker --region "$AWS_REGION"
+aws iam list-open-id-connect-providers
+```
+
+> The OIDC trust policy is pinned to one repository by name. If you forked
+> or renamed, change `github_repository` and re-apply, or CI is refused a
+> token.
 
 ---
 
 ## Phase 2 - Build and push the first images
 
-`envs/dev` creates Cloud Run resources that reference an image by tag, and
-Cloud Run rejects a deploy whose image does not exist. So images come before
-the first `terraform apply`, not after. From then on CI owns them.
+The cluster pulls by tag, and a pod whose image does not exist sits in
+`ImagePullBackOff`. Images come before the first apply; CI owns them after.
 
-- [ ] Authenticate Docker against Artifact Registry
+```bash
+aws ecr get-login-password --region "$AWS_REGION" \
+  | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-      gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
-
-- [ ] Build and push both images
-
-      cd "$(git rev-parse --show-toplevel)"
-      docker buildx build --platform linux/amd64 \
-        -f api/Dockerfile -t "${REGISTRY}/api:bootstrap" --push .
-      docker buildx build --platform linux/amd64 \
-        -f worker/Dockerfile -t "${REGISTRY}/worker:bootstrap" --push .
+cd "$(git rev-parse --show-toplevel)"
+docker buildx build --platform linux/amd64 -f api/Dockerfile    -t "$ECR/api:bootstrap"    --push .
+docker buildx build --platform linux/amd64 -f worker/Dockerfile -t "$ECR/worker:bootstrap" --push .
+```
 
 > `--platform linux/amd64` is not optional on an Apple Silicon Mac. Without
-> it Docker builds arm64, Cloud Run refuses the image, and the error names a
+> it Docker builds arm64, Fargate refuses the image, and the error names a
 > manifest rather than the architecture, which is a slow thing to debug.
 
-**Check:** both tags are listed.
+**Check:**
 
 ```bash
-gcloud artifacts docker images list "$REGISTRY" --include-tags
+aws ecr describe-images --repository-name jenie/api --region "$AWS_REGION" \
+  --query 'imageDetails[].imageTags'
 ```
 
 ---
 
-## Phase 3 - Apply the dev environment
+## Phase 3 - The cluster
 
-- [ ] Point at the state bucket
-
-      cd infra/terraform/envs/dev
-      cp backend.hcl.example backend.hcl
-      # bucket = "<project_id>-tfstate"
-
-- [ ] Set the variables
-
-      cp terraform.tfvars.example terraform.tfvars
-      # project_id, region,
-      # api_image    = "<REGISTRY>/api:bootstrap"
-      # worker_image = "<REGISTRY>/worker:bootstrap"
-      # alert_emails = ["you@example.com"]
-
-- [ ] Apply
-
-      terraform init -backend-config=backend.hcl
-      terraform plan        # read it before applying
-      terraform apply
-
-Cloud SQL takes roughly 10 to 15 minutes to create. That is normal.
-
-**Check:** the service answers.
+This is the expensive one, and it takes 15 to 20 minutes.
 
 ```bash
-API_URL=$(terraform output -raw api_url)
-curl -fsS "$API_URL/healthz"    # {"status":"ok"}
-curl -fsS "$API_URL/readyz"     # {"status":"ready"}
+cd infra/terraform/cluster
+cp backend.hcl.example backend.hcl        # bucket and lock table from Phase 1
+cp terraform.tfvars.example terraform.tfvars
+terraform init -backend-config=backend.hcl
+terraform plan                             # read it before applying
+terraform apply
 ```
 
-A failing `/readyz` with a healthy `/healthz` means the database is not
-reachable: check that the private service connection finished and that the
-`DATABASE_URL` secret resolved.
-
----
-
-## Phase 4 - Index the knowledge base
-
-- [ ] Run the indexer job once
-
-      gcloud run jobs execute jenie-dev-worker --region "$REGION" --wait
-
-**Check:** retrieval returns sources.
+**Check:**
 
 ```bash
-curl -fsS "$API_URL/ask" -H 'content-type: application/json' \
-  -d '{"query":"How do I reset my password?"}'
+eval "$(terraform output -raw update_kubeconfig)"
+kubectl -n argo-rollouts get deploy argo-rollouts
+kubectl -n kube-system get deploy aws-load-balancer-controller
+aws amp list-workspaces --region "$AWS_REGION"
 ```
 
-Empty `sources` means the index is empty. Check the job's logs:
+Both controllers must report `Available`. A Rollout without its controller
+is an inert object and nothing will tell you so.
+
+- [ ] Confirm the SNS subscription that arrives by email, or alerts go nowhere
+
+---
+
+## Phase 4 - The prod database
+
+The cluster root creates the instance and the dev database. Prod gets its
+own database on the same instance, which Terraform cannot create because it
+has no Postgres connection from outside the VPC.
 
 ```bash
-gcloud run jobs executions list --job jenie-dev-worker --region "$REGION"
+kubectl -n jenie-dev run psql --rm -it --restart=Never \
+  --image=postgres:16-alpine -- \
+  psql "$(aws secretsmanager get-secret-value --region "$AWS_REGION" \
+    --secret-id jenie/database-url --query SecretString --output text)"
 ```
 
----
+```sql
+CREATE DATABASE jenie_prod;
+-- Postgres lets any role connect to any database until this is revoked.
+-- Without it, a leaked dev credential is also a prod credential.
+REVOKE CONNECT ON DATABASE jenie_prod FROM jenie_app;
+```
 
-## Phase 5 - Hand over to CI/CD
-
-Up to here everything was applied by hand. From now on the repository is the
-source of truth and nothing is applied from a workstation.
-
-- [ ] Publish the repository variables
-
-      cd infra/terraform/bootstrap
-      terraform output -json github_repository_variables \
-        | jq -r 'to_entries[] | "\(.key)=\(.value)"' \
-        | while IFS='=' read -r k v; do gh variable set "$k" --body "$v" --repo "$REPO"; done
-
-      # Without gh: print them and paste into
-      # Settings -> Secrets and variables -> Actions -> Variables
-      terraform output github_repository_variables
-
-  Six variables, no secrets. Federation means there is no key to store.
-
-- [ ] Create the GitHub Environments
-
-      Settings -> Environments -> New environment
-
-      dev    no protection rules
-      prod   Required reviewers: yourself
-
-> This step is easy to skip and it matters. If the environments do not exist,
-> GitHub creates them silently on first use **with no protection at all**, and
-> the production approval gate the workflows are built around will not exist.
-> Nothing in Terraform or in the workflow can enforce it; it is a repository
-> setting.
-
-- [ ] Confirm CI is green
-
-      gh run list --repo "$REPO" --limit 5
-
-  Before the variables are set, the cloud jobs skip and the pipeline is green
-  on lint, tests, scanning, the integration evaluation and
-  `terraform validate`. After they are set, `build`, `apply` and the drift
-  check start running on their own.
-
-**Check:** open a trivial pull request touching `infra/` and confirm the
-`terraform` workflow posts a plan comment on it.
+**Check:** `\l` lists both `jenie` and `jenie_prod`.
 
 ---
 
-## Phase 6 - Production, when you want it
-
-Read the cost note first.
-
-- [ ] `cd infra/terraform/envs/prod`, same steps as Phase 3
-- [ ] Confirm `prod` has a required reviewer before the first apply
-- [ ] Run the indexer job for prod
-- [ ] Confirm alert emails arrive: trigger one deliberately, or check
-      Monitoring -> Alerting -> Notification channels
-
----
-
-## Cost
-
-`envs/prod` runs regional Cloud SQL with a standby in a second zone and keeps
-one Cloud Run instance warm. That is a real monthly bill, in the hundreds of
-US dollars, and it accrues whether or not anyone uses the service.
-
-For a demonstration, apply `envs/dev` only: zonal database, Cloud Run scaling
-to zero. Leave the prod configuration in the repository as the written
-statement of how it would be run. A reviewer reads the configuration; they do
-not check your invoice.
-
-- [ ] `billing_account` set in bootstrap so the budget and its alerts exist
-- [ ] Budget visible under Billing -> Budgets and alerts
-
----
-
-## Teardown
+## Phase 5 - Deploy dev
 
 ```bash
 cd infra/terraform/envs/dev
-terraform destroy
+cp backend.hcl.example backend.hcl
+cp terraform.tfvars.example terraform.tfvars
+terraform init -backend-config=backend.hcl
+terraform apply
+eval "$(terraform output -raw helm_command)"
 ```
 
-Prod has `deletion_protection = true` on the database, so a destroy there
-fails until it is deliberately turned off. That is intentional.
+**Check:**
 
-Bootstrap is normally left in place: it holds the state bucket and the
-registry. If you do remove it, empty the bucket first, since `force_destroy`
-is `false` on purpose.
+```bash
+kubectl -n jenie-dev rollout status deploy/jenie-helpdesk-ai-dev-api
+kubectl -n jenie-dev port-forward svc/jenie-helpdesk-ai-dev-api 8000:80 &
+curl -fsS localhost:8000/healthz
+curl -fsS localhost:8000/readyz
+```
+
+A failing `/readyz` with a healthy `/healthz` means the database is not
+reachable. Check the security group, and that the service account picked up
+its role: `kubectl -n jenie-dev describe sa jenie-helpdesk-ai-dev`.
+
+---
+
+## Phase 6 - Index, then verify retrieval
+
+```bash
+kubectl -n jenie-dev create job --from=cronjob/jenie-helpdesk-ai-dev-indexer indexer-manual
+kubectl -n jenie-dev wait --for=condition=complete job/indexer-manual --timeout=5m
+
+python3 scripts/eval.py --base-url http://localhost:8000
+```
+
+**Check:** the evaluation reports a 100 percent pass rate. Empty `sources`
+means the index is empty; read the job's logs.
+
+---
+
+## Phase 7 - Stop paying
+
+Do this the moment the demo is over. Set the reminder now, not later.
+
+```bash
+cd infra/terraform/envs/dev && terraform destroy
+cd ../../cluster            && terraform destroy   # the $73/month one
+```
+
+Bootstrap is cheap to leave: S3, ECR and IAM cost pennies. If you remove it
+too, empty the bucket first.
+
+**Check:**
+
+```bash
+aws eks list-clusters --region "$AWS_REGION"                 # empty
+aws rds describe-db-instances --region "$AWS_REGION" \
+  --query 'DBInstances[].DBInstanceIdentifier'               # empty
+```
+
+---
+
+## Phase 8 - Production, and watching a canary decide
+
+```bash
+cd infra/terraform/envs/prod   # same steps as Phase 5
+```
+
+- [ ] The `prod` GitHub Environment has a required reviewer **before** the first run
+
+> GitHub creates a missing environment silently on first use **with no
+> protection at all**. The approval gate the workflows are built around does
+> not exist until the environment is created deliberately. Nothing in
+> Terraform or in the workflow can enforce it.
+
+Watch a release make its own decision:
+
+```bash
+kubectl argo rollouts get rollout jenie-helpdesk-ai-prod-api -n jenie-prod --watch
+```
+
+It shifts to 10 percent, runs the analysis against Managed Prometheus, and
+either proceeds or aborts. To see it abort on purpose, deploy an image that
+returns errors and watch the run fail:
+
+```bash
+kubectl -n jenie-prod get analysisrun \
+  -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,MESSAGE:.status.message
+```
+
+---
+
+## Phase 9 - Hand over to CI/CD
+
+```bash
+cd infra/terraform/bootstrap
+terraform output -json github_repository_variables \
+  | jq -r 'to_entries[] | "\(.key)=\(.value)"' \
+  | while IFS='=' read -r k v; do gh variable set "$k" --body "$v" --repo "$REPO"; done
+
+# EKS_CLUSTER_NAME comes from the cluster root, not from bootstrap
+gh variable set EKS_CLUSTER_NAME --repo "$REPO" \
+  --body "$(cd ../cluster && terraform output -raw cluster_name)"
+```
+
+Before the variables are set, the cloud jobs skip and the pipeline is green
+on lint, tests, scanning, the integration evaluation and `terraform
+validate`. After they are set, build, deploy and the drift check start
+running on their own.
 
 ---
 
@@ -256,11 +258,11 @@ is `false` on purpose.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `Error 403: ... API has not been used` | Phase 1 skipped or incomplete | Re-apply bootstrap |
-| Cloud Run deploy rejects the image | Image built for arm64 | Rebuild with `--platform linux/amd64` |
-| `terraform apply` hangs on Cloud SQL | Normal, 10 to 15 minutes | Wait |
-| `/readyz` returns 503 | Database unreachable | Check the private service connection and the `DATABASE_URL` secret |
-| `/ask` returns empty `sources` | Index is empty | Run the indexer job (Phase 4) |
-| CI: `failed to generate Google Cloud federated token` | Variables wrong, or the attribute condition does not match this repository | Re-check the six variables and `github_repository` in bootstrap |
-| Prod deployed without approval | The `prod` environment has no required reviewer | Add one in Settings -> Environments |
-| Daily `drift` issue opened | Something was changed outside Terraform | Either commit the change or re-apply from `main` |
+| Pods stuck `Pending` | No Fargate profile matches the namespace | Add it to `fargate_namespaces`, re-apply the cluster |
+| `ImagePullBackOff` | Image missing, or built for arm64 | Phase 2, with `--platform linux/amd64` |
+| `/readyz` returns 503 | Database unreachable | Security group, and the service account's role annotation |
+| Ingress never gets an address | Load balancer controller down, or subnets untagged | `kubectl -n kube-system logs deploy/aws-load-balancer-controller` |
+| Rollout sits at 10 percent | The analysis cannot reach Prometheus | `prometheusAddress`, and the controller's IAM role |
+| Canary aborts immediately | Correct, if the indicators really are bad. Otherwise too little traffic to measure | `kubectl -n jenie-prod describe analysisrun` |
+| CI: `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Repository name does not match the OIDC trust policy | Re-apply bootstrap with the right `github_repository` |
+| A bill larger than expected | The cluster is still running | Phase 7 |

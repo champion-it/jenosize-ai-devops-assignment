@@ -2,21 +2,24 @@ terraform {
   required_version = ">= 1.9.0"
 
   required_providers {
-    google = {
-      source  = "hashicorp/google"
-      version = "~> 6.14"
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.80"
     }
   }
 
-  # Deliberately no backend block.
+  # No backend block on purpose.
   #
   # This configuration creates the bucket the environments keep their state
   # in, so it cannot keep its own state there on the first run. Its state
   # stays local and is git ignored. Losing it is recoverable: every resource
-  # here is either idempotent to recreate or can be imported.
+  # here is idempotent to recreate or can be imported.
 }
 
-provider "google" {
-  project = var.project_id
-  region  = var.region
+provider "aws" {
+  region = var.region
+
+  default_tags {
+    tags = var.tags
+  }
 }

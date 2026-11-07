@@ -1,0 +1,99 @@
+{{- if and .Values.rollout.enabled .Values.rollout.analysis.enabled }}
+# What decides whether a canary is allowed to proceed.
+#
+# This is the reason for running Argo Rollouts rather than a rolling update:
+# the decision comes from the same service level indicators that
+# docs/slo.md defines and that the burn-rate alerts fire on, not from a
+# timer and not from someone watching a dashboard.
+#
+# The namespace is substituted at render time rather than passed as an Argo
+# argument. Argo's own template syntax uses the same delimiters as Helm,
+# so passing it through has to be escaped character by character, and the
+# result is unreadable for no gain when the value is already known at
+# render time.
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: {{ include "jenie.fullname" . }}-slo
+  labels:
+    {{- include "jenie.labels" . | nindent 4 }}
+spec:
+  metrics:
+    # Availability. The threshold is the burn rate that pages, so a canary
+    # is stopped by the same condition that would otherwise have woken
+    # someone up, rather than by a second number invented for deployments.
+    - name: availability-burn-rate
+      interval: {{ .Values.rollout.analysis.interval }}
+      count: {{ .Values.rollout.analysis.count }}
+      # One bad sample is a blip. Two in a row during a canary is the canary.
+      failureLimit: {{ .Values.rollout.analysis.failureLimit }}
+      # Let the new pods serve real traffic before judging them.
+      initialDelay: {{ .Values.rollout.analysis.initialDelay }}
+      successCondition: result[0] <= {{ .Values.rollout.analysis.maxErrorRatio }}
+      provider:
+        prometheus:
+          address: {{ .Values.rollout.analysis.prometheusAddress | quote }}
+          {{- with .Values.rollout.analysis.prometheusHeaders }}
+          headers:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          query: >-
+            scalar(
+            (sum(rate(http_requests_total{namespace="{{ .Release.Namespace }}",status="5xx"}[2m])) or vector(0))
+            /
+            clamp_min(sum(rate(http_requests_total{namespace="{{ .Release.Namespace }}"}[2m])), 1e-9)
+            )
+
+    # Latency, as the share of requests that missed the 2 second objective.
+    #
+    # Written as slow over total, not one minus fast. One minus fast
+    # evaluates to 1 when there is no traffic, which reads as "everything is
+    # slow" and would abort every canary deployed into a quiet period.
+    - name: latency-slo
+      interval: {{ .Values.rollout.analysis.interval }}
+      count: {{ .Values.rollout.analysis.count }}
+      failureLimit: {{ .Values.rollout.analysis.failureLimit }}
+      initialDelay: {{ .Values.rollout.analysis.initialDelay }}
+      successCondition: result[0] <= {{ .Values.rollout.analysis.maxSlowRatio }}
+      provider:
+        prometheus:
+          address: {{ .Values.rollout.analysis.prometheusAddress | quote }}
+          {{- with .Values.rollout.analysis.prometheusHeaders }}
+          headers:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          query: >-
+            scalar(
+            (sum(rate(http_request_duration_seconds_count{namespace="{{ .Release.Namespace }}",route="/ask"}[2m]))
+            -
+            sum(rate(http_request_duration_seconds_bucket{namespace="{{ .Release.Namespace }}",route="/ask",le="2.0"}[2m])))
+            /
+            clamp_min(sum(rate(http_request_duration_seconds_count{namespace="{{ .Release.Namespace }}",route="/ask"}[2m])), 1e-9)
+            )
+
+    {{- if .Values.rollout.analysis.checkRetrievalQuality }}
+    # Retrieval quality is not an SLO - a query that finds nothing still
+    # returns a correct, honest answer - but a release that broke the
+    # embedding or the index would show here first and nowhere else. Every
+    # request would still succeed, so neither SLI would notice.
+    - name: retrieval-quality
+      interval: {{ .Values.rollout.analysis.interval }}
+      count: {{ .Values.rollout.analysis.count }}
+      failureLimit: {{ .Values.rollout.analysis.failureLimit }}
+      initialDelay: {{ .Values.rollout.analysis.initialDelay }}
+      successCondition: result[0] <= {{ .Values.rollout.analysis.maxEmptyRetrievalRatio }}
+      provider:
+        prometheus:
+          address: {{ .Values.rollout.analysis.prometheusAddress | quote }}
+          {{- with .Values.rollout.analysis.prometheusHeaders }}
+          headers:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          query: >-
+            scalar(
+            (sum(rate(rag_empty_retrieval_total{namespace="{{ .Release.Namespace }}"}[5m])) or vector(0))
+            /
+            clamp_min(sum(rate(http_requests_total{namespace="{{ .Release.Namespace }}",route="/ask"}[5m])), 1e-9)
+            )
+    {{- end }}
+{{- end }}

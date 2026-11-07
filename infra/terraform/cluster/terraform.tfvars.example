@@ -1,0 +1,5 @@
+region       = "ap-southeast-1"
+alert_emails = ["you@example.com"]
+
+# Narrow this once you know the address you will run kubectl from.
+# cluster_public_access_cidrs = ["203.0.113.0/24"]

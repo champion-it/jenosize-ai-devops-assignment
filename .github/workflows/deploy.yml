@@ -1,5 +1,9 @@
 name: deploy
 
+# Dev takes the release directly. Prod goes out as a canary that Argo
+# Rollouts judges against the service level indicators and aborts on its
+# own if they degrade - see docs/slo.md.
+
 on:
   workflow_run:
     workflows: [ci]
@@ -18,23 +22,24 @@ on:
 
 permissions:
   contents: read
+  # Required to exchange the GitHub token for AWS credentials. There is no
+  # access key anywhere in this repository or in its secrets.
   id-token: write
 
 concurrency:
   group: deploy-${{ github.event.inputs.environment || 'dev' }}
   cancel-in-progress: false
 
+env:
+  CHART_PATH: infra/k8s
+
 jobs:
   deploy-dev:
     name: Deploy to dev
-    # Skipped until the Google Cloud repository variables are set, so a
-    # checkout without them still shows a green pipeline rather than a
-    # wall of credential failures. Setting the variables activates this
-    # job; no change here is needed.
     if: >-
       (github.event_name == 'workflow_dispatch' ||
        github.event.workflow_run.conclusion == 'success') &&
-      vars.GCP_PROJECT_ID != ''
+      vars.AWS_DEPLOY_ROLE_ARN != ''
     runs-on: ubuntu-latest
     environment: dev
     outputs:
@@ -47,8 +52,6 @@ jobs:
         # Values reach the shell through the environment, never through
         # expression interpolation into the script body: a tag containing
         # shell metacharacters would otherwise be executed rather than read.
-        # The result is constrained to the characters a tag may contain, so a
-        # malformed value fails here instead of reaching a deploy command.
         env:
           INPUT_TAG: ${{ github.event.inputs.image_tag }}
           RUN_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -66,112 +69,104 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - uses: google-github-actions/auth@v2
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Deploy API, taking all traffic
+      - name: Connect to the cluster
         run: |
-          gcloud run deploy jenie-api-dev \
-            --region "${{ vars.GCP_REGION }}" \
-            --image "${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/api:${{ steps.resolve.outputs.tag }}" \
-            --quiet
+          aws eks update-kubeconfig \
+            --name "${{ vars.EKS_CLUSTER_NAME }}" \
+            --region "${{ vars.AWS_REGION }}"
 
-      - name: Update the indexer job
+      - name: Deploy
         run: |
-          gcloud run jobs update jenie-worker-dev \
-            --region "${{ vars.GCP_REGION }}" \
-            --image "${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/worker:${{ steps.resolve.outputs.tag }}" \
-            --quiet
+          helm upgrade --install jenie "$CHART_PATH" \
+            --namespace jenie-dev \
+            --create-namespace \
+            -f "$CHART_PATH/values-dev.yaml" \
+            --set image.registry="${{ vars.ECR_REGISTRY }}/jenie" \
+            --set image.api.tag="${{ steps.resolve.outputs.tag }}" \
+            --set image.worker.tag="${{ steps.resolve.outputs.tag }}" \
+            --wait --timeout 10m
 
       - name: Smoke test
         run: |
-          URL=$(gcloud run services describe jenie-api-dev \
-            --region "${{ vars.GCP_REGION }}" --format='value(status.url)')
-          curl -fsS "$URL/healthz"
-          python3 scripts/eval.py --base-url "$URL" --min-pass-rate 0.8
+          kubectl -n jenie-dev rollout status deploy/jenie-helpdesk-ai-dev-api --timeout=5m
+          kubectl -n jenie-dev port-forward svc/jenie-helpdesk-ai-dev-api 8000:80 &
+          sleep 5
+          curl -fsS localhost:8000/healthz
+          python3 scripts/eval.py --base-url http://localhost:8000 --min-pass-rate 0.8
 
   deploy-prod:
     name: Deploy to prod (canary)
     needs: deploy-dev
-    if: vars.GCP_PROJECT_ID != ''
+    if: vars.AWS_DEPLOY_ROLE_ARN != ''
     runs-on: ubuntu-latest
-    # The prod environment carries a required reviewer, so this job waits for
-    # a human before any production traffic moves.
+    # Carries a required reviewer, so this waits for a human before any
+    # production traffic moves.
     environment: prod
     steps:
       - uses: actions/checkout@v4
 
-      - uses: google-github-actions/auth@v2
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Record the currently serving revision
-        id: stable
+      - name: Connect to the cluster
         run: |
-          # Captured before anything moves so rollback has a concrete target
-          # rather than relying on "latest", which the canary has changed.
-          echo "name=$(gcloud run services describe jenie-api-prod \
-            --region '${{ vars.GCP_REGION }}' \
-            --format='value(status.traffic.filter(\"percent:100\").extract(\"revisionName\"))' \
-            | tr -d '[]')" >> "$GITHUB_OUTPUT"
+          aws eks update-kubeconfig \
+            --name "${{ vars.EKS_CLUSTER_NAME }}" \
+            --region "${{ vars.AWS_REGION }}"
 
-      - name: Deploy new revision with no traffic
-        id: revision
+      - name: Install the rollouts plugin
         run: |
-          gcloud run deploy jenie-api-prod \
-            --region "${{ vars.GCP_REGION }}" \
-            --image "${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie/api:${{ needs.deploy-dev.outputs.image_tag }}" \
-            --no-traffic --tag candidate --quiet
-          echo "name=$(gcloud run services describe jenie-api-prod \
-            --region '${{ vars.GCP_REGION }}' \
-            --format='value(status.latestCreatedRevisionName)')" >> "$GITHUB_OUTPUT"
+          curl -sSLo /usr/local/bin/kubectl-argo-rollouts \
+            https://github.com/argoproj/argo-rollouts/releases/download/v1.7.2/kubectl-argo-rollouts-linux-amd64
+          chmod +x /usr/local/bin/kubectl-argo-rollouts
 
-      - name: Verify the candidate before any traffic moves
+      - name: Start the canary
+        # helm does not wait here on purpose. The Rollout is meant to pause
+        # at each weight while the analysis runs; waiting for it to be
+        # "ready" would either time out or mask the point of the exercise.
         run: |
-          # The candidate tag gives the new revision its own URL, so it can be
-          # exercised end to end while real traffic is still on the old one.
-          URL=$(gcloud run services describe jenie-api-prod \
-            --region "${{ vars.GCP_REGION }}" \
-            --format='value(status.traffic.filter("tag:candidate").extract("url"))' | tr -d '[]')
-          curl -fsS "$URL/healthz"
-          python3 scripts/eval.py --base-url "$URL" --min-pass-rate 0.8 --max-p95-ms 2000
+          helm upgrade --install jenie "$CHART_PATH" \
+            --namespace jenie-prod \
+            --create-namespace \
+            -f "$CHART_PATH/values-prod.yaml" \
+            --set image.registry="${{ vars.ECR_REGISTRY }}/jenie" \
+            --set image.api.tag="${{ needs.deploy-dev.outputs.image_tag }}" \
+            --set image.worker.tag="${{ needs.deploy-dev.outputs.image_tag }}"
 
-      - name: Shift 10 percent of traffic
+      - name: Watch it to completion
+        id: watch
+        # Exits non-zero if the analysis aborts the canary, which fails this
+        # job. Argo has already shifted traffic back by then; the failure is
+        # the report, not the remedy.
         run: |
-          gcloud run services update-traffic jenie-api-prod \
-            --region "${{ vars.GCP_REGION }}" \
-            --to-revisions "${{ steps.revision.outputs.name }}=10" --quiet
+          kubectl argo rollouts status jenie-helpdesk-ai-prod-api \
+            --namespace jenie-prod \
+            --timeout 20m
 
-      - name: Hold and verify the canary
+      - name: Report what the analysis decided
+        if: always()
         run: |
-          # Held long enough for the 5 minute error-rate alert window to cover
-          # the canary before it is widened.
-          sleep 300
-          URL=$(gcloud run services describe jenie-api-prod \
-            --region "${{ vars.GCP_REGION }}" --format='value(status.url)')
-          curl -fsS "$URL/healthz"
-          python3 scripts/eval.py --base-url "$URL" --min-pass-rate 0.8
+          kubectl argo rollouts get rollout jenie-helpdesk-ai-prod-api \
+            --namespace jenie-prod --no-color || true
+          echo "--- analysis runs ---"
+          kubectl -n jenie-prod get analysisrun \
+            -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,MESSAGE:.status.message \
+            || true
 
-      - name: Promote to 100 percent
+      - name: Abort explicitly if the watch failed for another reason
+        if: failure()
+        # The analysis aborts on its own. This covers a timeout or a
+        # cancelled job, where the Rollout would otherwise sit paused with
+        # traffic split.
         run: |
-          gcloud run services update-traffic jenie-api-prod \
-            --region "${{ vars.GCP_REGION }}" \
-            --to-revisions "${{ steps.revision.outputs.name }}=100" --quiet
-
-      - name: Roll back
-        if: failure() && steps.stable.outputs.name != ''
-        run: |
-          # Traffic returns to the revision that was serving before this run.
-          # Nothing is rebuilt, so rollback completes in seconds.
-          gcloud run services update-traffic jenie-api-prod \
-            --region "${{ vars.GCP_REGION }}" \
-            --to-revisions "${{ steps.stable.outputs.name }}=100" --quiet
+          kubectl argo rollouts abort jenie-helpdesk-ai-prod-api \
+            --namespace jenie-prod || true
+          kubectl argo rollouts undo jenie-helpdesk-ai-prod-api \
+            --namespace jenie-prod || true

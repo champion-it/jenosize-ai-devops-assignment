@@ -1,14 +1,10 @@
 # Copy to terraform.tfvars and fill in. terraform.tfvars is git ignored.
 #
-# project_number: gcloud projects describe <project_id> --format='value(projectNumber)'
-# billing_account: gcloud billing accounts list
+# account id: aws sts get-caller-identity --query Account --output text
 
-project_id        = "jenosize-jenie"
-project_number    = "123456789012"
-region            = "asia-southeast1"
-state_bucket_name = "jenosize-jenie-tfstate"
+region            = "ap-southeast-1"
+state_bucket_name = "jenie-tfstate-123456789012"
 github_repository = "champion-it/jenosize-ai-devops-assignment-yodthong"
 
-# Optional. Omit to skip the budget.
-billing_account = "000000-AAAAAA-BBBBBB"
-monthly_budget  = 50
+monthly_budget_usd  = 100
+budget_alert_emails = ["you@example.com"]

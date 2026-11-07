@@ -1,8 +1,9 @@
 """Runtime configuration.
 
 Every value is read from the environment so that the same image runs
-unchanged in docker-compose, Cloud Run dev and Cloud Run prod. Secrets are
-injected by Secret Manager in GCP and by a local .env file in development.
+unchanged in docker-compose and in both cluster namespaces. Secrets are
+read from Secrets Manager in the cluster and from a local .env file in
+development.
 """
 
 from __future__ import annotations

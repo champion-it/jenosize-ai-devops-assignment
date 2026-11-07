@@ -1,144 +1,175 @@
-# Private networking for the platform.
+# VPC for the platform.
 #
-# Cloud SQL is reachable only over private IP. Cloud Run reaches it through
-# Direct VPC egress, which avoids the extra hop and cost of a Serverless VPC
-# Access connector.
+# Two tiers: public subnets carry the load balancer and the NAT gateway,
+# private subnets carry the EKS nodes and the database. Nothing that holds
+# data or runs application code has a route from the internet.
+#
+# One NAT gateway rather than one per availability zone. Per-AZ is the
+# resilient answer and costs an extra $32 a month per zone; for this
+# platform the trade is stated rather than made silently, and
+# single_nat_gateway is the switch.
 
-resource "google_compute_network" "main" {
-  name                    = "${var.name_prefix}-vpc"
-  auto_create_subnetworks = false
-  routing_mode            = "REGIONAL"
+locals {
+  # Subnets are carved from the VPC CIDR rather than listed, so changing the
+  # VPC range does not mean editing six more values.
+  public_subnets  = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 4, i)]
+  private_subnets = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 4, i + 8)]
 }
 
-resource "google_compute_subnetwork" "main" {
-  name          = "${var.name_prefix}-subnet"
-  ip_cidr_range = var.subnet_cidr
-  region        = var.region
-  network       = google_compute_network.main.id
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
 
-  # Flow logs give the audit trail enterprise and government work expects.
-  log_config {
-    aggregation_interval = "INTERVAL_10_MIN"
-    flow_sampling        = 0.5
-    metadata             = "INCLUDE_ALL_METADATA"
-  }
-
-  private_ip_google_access = true
+  tags = merge(var.tags, { Name = "${var.name_prefix}-vpc" })
 }
 
-# Range handed to Google for the managed Cloud SQL instance.
-resource "google_compute_global_address" "private_service_range" {
-  name          = "${var.name_prefix}-psa"
-  purpose       = "VPC_PEERING"
-  address_type  = "INTERNAL"
-  prefix_length = 16
-  network       = google_compute_network.main.id
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+  tags   = merge(var.tags, { Name = "${var.name_prefix}-igw" })
 }
 
-resource "google_service_networking_connection" "private_service_access" {
-  network                 = google_compute_network.main.id
-  service                 = "servicenetworking.googleapis.com"
-  reserved_peering_ranges = [google_compute_global_address.private_service_range.name]
+resource "aws_subnet" "public" {
+  count = var.az_count
+
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = local.public_subnets[count.index]
+  availability_zone       = var.availability_zones[count.index]
+  map_public_ip_on_launch = true
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-public-${var.availability_zones[count.index]}"
+    # The load balancer controller finds subnets by these tags. Without
+    # them it fails with an error that does not mention tags at all.
+    "kubernetes.io/role/elb" = "1"
+  })
 }
 
-# Default deny. Nothing talks to anything until a rule below allows it.
-resource "google_compute_firewall" "deny_all_ingress" {
-  name      = "${var.name_prefix}-deny-all-ingress"
-  network   = google_compute_network.main.name
-  direction = "INGRESS"
-  priority  = 65534
+resource "aws_subnet" "private" {
+  count = var.az_count
 
-  deny {
-    protocol = "all"
-  }
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = local.private_subnets[count.index]
+  availability_zone = var.availability_zones[count.index]
 
-  source_ranges = ["0.0.0.0/0"]
+  tags = merge(var.tags, {
+    Name                              = "${var.name_prefix}-private-${var.availability_zones[count.index]}"
+    "kubernetes.io/role/internal-elb" = "1"
+  })
 }
 
-resource "google_compute_firewall" "allow_internal_postgres" {
-  name      = "${var.name_prefix}-allow-internal-postgres"
-  network   = google_compute_network.main.name
-  direction = "INGRESS"
-  priority  = 1000
+resource "aws_eip" "nat" {
+  count = var.single_nat_gateway ? 1 : var.az_count
 
-  allow {
-    protocol = "tcp"
-    ports    = ["5432"]
-  }
-
-  source_ranges = [var.subnet_cidr]
+  domain = "vpc"
+  tags   = merge(var.tags, { Name = "${var.name_prefix}-nat-${count.index}" })
 }
 
-# Edge protection for the public entry point. Rate limiting here is the
-# primary control; the application level limiter is the fallback.
-resource "google_compute_security_policy" "edge" {
-  count = var.enable_cloud_armor ? 1 : 0
-  name  = "${var.name_prefix}-edge-policy"
+resource "aws_nat_gateway" "main" {
+  count = var.single_nat_gateway ? 1 : var.az_count
 
-  rule {
-    action   = "rate_based_ban"
-    priority = 1000
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
 
-    match {
-      versioned_expr = "SRC_IPS_V1"
-      config {
-        src_ip_ranges = ["*"]
-      }
-    }
+  tags       = merge(var.tags, { Name = "${var.name_prefix}-nat-${count.index}" })
+  depends_on = [aws_internet_gateway.main]
+}
 
-    rate_limit_options {
-      conform_action = "allow"
-      exceed_action  = "deny(429)"
-      enforce_on_key = "IP"
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
 
-      rate_limit_threshold {
-        count        = var.rate_limit_per_minute
-        interval_sec = 60
-      }
-
-      ban_duration_sec = 300
-    }
-
-    description = "Per IP rate limit"
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
   }
 
-  rule {
-    action   = "deny(403)"
-    priority = 900
+  tags = merge(var.tags, { Name = "${var.name_prefix}-public" })
+}
 
-    match {
-      expr {
-        expression = "evaluatePreconfiguredExpr('sqli-v33-stable')"
-      }
-    }
+resource "aws_route_table_association" "public" {
+  count = var.az_count
 
-    description = "Block SQL injection signatures"
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table" "private" {
+  count = var.single_nat_gateway ? 1 : var.az_count
+
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main[count.index].id
   }
 
-  rule {
-    action   = "deny(403)"
-    priority = 901
+  tags = merge(var.tags, { Name = "${var.name_prefix}-private-${count.index}" })
+}
 
-    match {
-      expr {
-        expression = "evaluatePreconfiguredExpr('xss-v33-stable')"
-      }
-    }
+resource "aws_route_table_association" "private" {
+  count = var.az_count
 
-    description = "Block cross site scripting signatures"
-  }
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private[var.single_nat_gateway ? 0 : count.index].id
+}
 
-  rule {
-    action   = "allow"
-    priority = 2147483647
+# Flow logs to CloudWatch. Enterprise and government work expects an audit
+# trail of what talked to what, and the time to turn it on is before the
+# question is asked.
+resource "aws_cloudwatch_log_group" "flow_logs" {
+  count = var.enable_flow_logs ? 1 : 0
 
-    match {
-      versioned_expr = "SRC_IPS_V1"
-      config {
-        src_ip_ranges = ["*"]
-      }
-    }
+  name              = "/aws/vpc/${var.name_prefix}"
+  retention_in_days = var.flow_log_retention_days
+  tags              = var.tags
+}
 
-    description = "Default allow"
-  }
+resource "aws_iam_role" "flow_logs" {
+  count = var.enable_flow_logs ? 1 : 0
+
+  name = "${var.name_prefix}-flow-logs"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "vpc-flow-logs.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+
+  tags = var.tags
+}
+
+resource "aws_iam_role_policy" "flow_logs" {
+  count = var.enable_flow_logs ? 1 : 0
+
+  name = "write-flow-logs"
+  role = aws_iam_role.flow_logs[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+      ]
+      Resource = "${aws_cloudwatch_log_group.flow_logs[0].arn}:*"
+    }]
+  })
+}
+
+resource "aws_flow_log" "main" {
+  count = var.enable_flow_logs ? 1 : 0
+
+  vpc_id                   = aws_vpc.main.id
+  traffic_type             = "ALL"
+  iam_role_arn             = aws_iam_role.flow_logs[0].arn
+  log_destination          = aws_cloudwatch_log_group.flow_logs[0].arn
+  max_aggregation_interval = 600
+
+  tags = var.tags
 }

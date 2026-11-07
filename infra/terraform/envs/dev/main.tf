@@ -1,77 +1,70 @@
 # Development environment.
 #
-# Same modules as prod, smaller and cheaper: single zone database, no
-# point in time recovery, scale to zero. The shape of the system is
-# identical so a change that works here behaves the same way in prod.
+# The cluster, the database instance and the metrics workspace are shared
+# and belong to the cluster root. What is per-environment is the Helm
+# release: this root holds the values that differ and the outputs the
+# release needs, so the two are versioned together rather than one living
+# in a wiki.
+#
+# Deliberately thin. An environment that only parameterises a chart should
+# look like it.
+
+data "terraform_remote_state" "cluster" {
+  backend = "s3"
+  config = {
+    bucket = var.cluster_state.bucket
+    key    = var.cluster_state.key
+    region = var.cluster_state.region
+  }
+}
 
 locals {
   environment = "dev"
-  name_prefix = "jenie-dev"
+  namespace   = "jenie-dev"
 }
 
-module "network" {
-  source = "../../modules/network"
+# The values the Helm release needs, rendered from what the cluster
+# actually created rather than copied by hand into a values file.
+resource "local_file" "helm_values" {
+  filename        = "${path.module}/generated-values.yaml"
+  file_permission = "0644"
 
-  name_prefix = local.name_prefix
-  region      = var.region
-  subnet_cidr = "10.20.0.0/24"
+  content = yamlencode({
+    environment = local.environment
 
-  # Cloud Armor needs a load balancer in front of Cloud Run. Dev is reached
-  # directly so the pipeline can smoke test it, and the application level
-  # rate limiter is the control here.
-  enable_cloud_armor = false
-}
+    namespace = {
+      create = true
+      name   = local.namespace
+    }
 
-module "database" {
-  source = "../../modules/database"
+    image = {
+      registry = data.terraform_remote_state.cluster.outputs.ecr_registry
+      api      = { tag = var.image_tag }
+      worker   = { tag = var.image_tag }
+    }
 
-  name_prefix                = local.name_prefix
-  region                     = var.region
-  network_id                 = module.network.network_id
-  private_service_connection = module.network.private_service_connection
+    serviceAccount = {
+      create = true
+      annotations = {
+        "eks.amazonaws.com/role-arn" = data.terraform_remote_state.cluster.outputs.workload_role_arns["dev"]
+      }
+    }
 
-  tier                   = "db-custom-1-3840"
-  disk_size_gb           = 20
-  highly_available       = false
-  point_in_time_recovery = false
-  retained_backups       = 7
-  deletion_protection    = false
-}
+    config = {
+      # Dev traces everything and talks more.
+      logLevel     = "DEBUG"
+      otelEndpoint = ""
+    }
 
-module "service" {
-  source = "../../modules/service"
+    # Dev keeps the Deployment: progressive delivery is a production
+    # concern, and a canary on one replica measures nothing.
+    rollout = {
+      enabled = false
+    }
 
-  project_id   = var.project_id
-  name_prefix  = local.name_prefix
-  environment  = local.environment
-  region       = var.region
-  network_name = module.network.network_name
-  subnet_name  = module.network.subnet_id
-
-  api_image    = var.api_image
-  worker_image = var.worker_image
-
-  database_url_secret_id   = module.database.database_url_secret_id
-  database_url_secret_name = module.database.database_url_secret_name
-
-  min_instances         = 0
-  max_instances         = 4
-  memory                = "512Mi"
-  log_level             = "DEBUG"
-  rate_limit_per_minute = 120
-  allow_unauthenticated = true
-  reindex_schedule      = "0 3 * * *"
-}
-
-module "observability" {
-  source = "../../modules/observability"
-
-  project_id       = var.project_id
-  environment      = local.environment
-  region           = var.region
-  api_service_name = module.service.api_service_name
-  worker_job_name  = module.service.worker_job_name
-  alert_emails     = var.alert_emails
-
-  log_retention_days = 14
+    networkPolicy = {
+      enabled      = true
+      databaseCIDR = data.terraform_remote_state.cluster.outputs.vpc_cidr
+    }
+  })
 }

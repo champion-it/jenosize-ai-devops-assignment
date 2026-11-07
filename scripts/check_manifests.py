@@ -19,8 +19,14 @@ import yaml
 REQUIRED_PROBES = ("startupProbe", "readinessProbe", "livenessProbe")
 
 
+# A Rollout carries the same pod spec as a Deployment. Missing it here
+# would mean the hardening checks silently stop applying the moment the
+# chart switches to progressive delivery.
+POD_OWNERS = ("Deployment", "Rollout")
+
+
 def pod_spec(doc: dict) -> dict | None:
-    if doc["kind"] == "Deployment":
+    if doc["kind"] in POD_OWNERS:
         return doc["spec"]["template"]["spec"]
     if doc["kind"] == "CronJob":
         return doc["spec"]["jobTemplate"]["spec"]["template"]["spec"]
@@ -63,11 +69,23 @@ def check(path: Path) -> list[str]:
                 if env["name"] == "DATABASE_URL" and "value" in env:
                     problems.append(f"{name}: DATABASE_URL is a literal value")
 
-        if kind == "Deployment":
+        if kind in POD_OWNERS:
             container = spec["containers"][0]
             for probe in REQUIRED_PROBES:
                 if probe not in container:
                     problems.append(f"{name}: missing {probe}")
+
+        if kind == "Rollout":
+            canary = doc["spec"].get("strategy", {}).get("canary", {})
+            if not canary.get("steps"):
+                problems.append(
+                    f"{name}: a Rollout with no canary steps is just a "
+                    "Deployment with extra words"
+                )
+            if "analysis" not in canary:
+                problems.append(
+                    f"{name}: canary has no analysis, so nothing can abort it"
+                )
 
     return problems
 

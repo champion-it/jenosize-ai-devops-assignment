@@ -35,11 +35,11 @@ jobs:
       - name: ruff format
         run: ruff format --check .
 
-      - name: SLO alert policies match the Prometheus rules
-        # The generated Cloud Monitoring policies are committed. If the alert
-        # rules changed without re-rendering, the objectives in production
-        # would quietly differ from the ones in the repository.
-        run: python3 scripts/render_slo_alerts.py --check
+      - name: Alert rules are valid
+        # Managed Service for Prometheus ingests this file verbatim, so a
+        # syntax error here is a broken production ruleset, not just a
+        # broken local one.
+        run: python3 -c "import yaml,sys; yaml.safe_load(open('observability/alerts/rules.yml')); print('alert rules parse')"
 
   test:
     name: Unit tests
@@ -150,7 +150,7 @@ jobs:
     # job; no change here is needed.
     if: >-
       github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-      vars.GCP_PROJECT_ID != ''
+      vars.AWS_DEPLOY_ROLE_ARN != ''
     strategy:
       matrix:
         service: [api, worker]
@@ -161,16 +161,13 @@ jobs:
         id: version
         run: echo "tag=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
 
-      - uses: google-github-actions/auth@v2
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Configure Artifact Registry
-        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
 
       - uses: docker/setup-buildx-action@v3
 
@@ -196,7 +193,7 @@ jobs:
         # Pushed only after the scan passes, so a vulnerable image never
         # reaches the registry where a deploy could pick it up.
         run: |
-          REGISTRY="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/jenie"
+          REGISTRY="${{ steps.ecr.outputs.registry }}/jenie"
           SRC="local/${{ matrix.service }}:${{ steps.version.outputs.tag }}"
           docker tag "$SRC" "$REGISTRY/${{ matrix.service }}:${{ steps.version.outputs.tag }}"
           docker tag "$SRC" "$REGISTRY/${{ matrix.service }}:sha-${GITHUB_SHA::12}"

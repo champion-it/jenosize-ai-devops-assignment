@@ -2,18 +2,21 @@ terraform {
   required_version = ">= 1.9.0"
 
   required_providers {
-    google = {
-      source  = "hashicorp/google"
-      version = "~> 6.14"
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.80"
     }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.6"
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.5"
     }
   }
 }
 
-provider "google" {
-  project = var.project_id
-  region  = var.region
+provider "aws" {
+  region = var.region
+
+  default_tags {
+    tags = var.tags
+  }
 }

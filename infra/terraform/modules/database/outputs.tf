@@ -1,19 +1,12 @@
-output "instance_name" {
-  value = google_sql_database_instance.main.name
-}
+output "instance_identifier" { value = aws_db_instance.main.identifier }
+output "endpoint" { value = aws_db_instance.main.address }
+output "port" { value = aws_db_instance.main.port }
+output "security_group_id" { value = aws_security_group.database.id }
 
-output "connection_name" {
-  value = google_sql_database_instance.main.connection_name
-}
-
-output "private_ip" {
-  value = google_sql_database_instance.main.private_ip_address
-}
-
-output "database_url_secret_id" {
-  value = google_secret_manager_secret.database_url.secret_id
+output "database_url_secret_arn" {
+  value = aws_secretsmanager_secret.database_url.arn
 }
 
 output "database_url_secret_name" {
-  value = google_secret_manager_secret.database_url.id
+  value = aws_secretsmanager_secret.database_url.name
 }

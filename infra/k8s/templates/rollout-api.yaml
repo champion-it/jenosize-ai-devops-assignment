@@ -1,0 +1,74 @@
+{{- if .Values.rollout.enabled }}
+# Progressive delivery with Argo Rollouts.
+#
+# A rolling update replaces pods and hopes. This shifts a named fraction of
+# traffic, measures the service level indicators defined in docs/slo.md
+# against the new version specifically, and aborts if they degrade - without
+# anyone watching.
+#
+# That is the whole reason this path exists. The alternative strategies in
+# this repository can roll back quickly; only this one decides to.
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ include "jenie.fullname" . }}-api
+  labels:
+    {{- include "jenie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  {{- if not .Values.api.autoscaling.enabled }}
+  replicas: {{ .Values.api.replicas }}
+  {{- end }}
+  revisionHistoryLimit: {{ .Values.rollout.revisionHistoryLimit }}
+
+  selector:
+    matchLabels:
+      {{- include "jenie.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+
+  template:
+    metadata:
+      labels:
+        {{- include "jenie.labels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.api.port | quote }}
+        prometheus.io/path: /metrics
+    spec:
+      {{- include "jenie.apiPodSpec" . | nindent 6 }}
+
+  strategy:
+    canary:
+      canaryService: {{ include "jenie.fullname" . }}-api-canary
+      stableService: {{ include "jenie.fullname" . }}-api
+
+      {{- if .Values.rollout.trafficRouting.alb.enabled }}
+      # Weighted target groups on the ALB. Without traffic routing the
+      # canary share is approximated by replica count, which is coarse and
+      # cannot express 10 percent on three replicas.
+      trafficRouting:
+        alb:
+          ingress: {{ include "jenie.fullname" . }}-api
+          servicePort: {{ .Values.rollout.trafficRouting.alb.servicePort }}
+          rootService: {{ include "jenie.fullname" . }}-api
+      {{- end }}
+
+      {{- if .Values.rollout.analysis.enabled }}
+      # Runs alongside the steps rather than between them, so a canary that
+      # degrades at 10 percent is aborted without waiting for the next gate.
+      analysis:
+        templates:
+          - templateName: {{ include "jenie.fullname" . }}-slo
+        startingStep: {{ .Values.rollout.analysis.startingStep }}
+      {{- end }}
+
+      steps:
+        {{- toYaml .Values.rollout.steps | nindent 8 }}
+
+      # On abort, traffic returns to the stable version immediately and the
+      # canary pods are removed. Nothing is rebuilt, so recovery is the time
+      # it takes to shift weight back.
+      abortScaleDownDelaySeconds: {{ .Values.rollout.abortScaleDownDelaySeconds }}
+      scaleDownDelaySeconds: {{ .Values.rollout.scaleDownDelaySeconds }}
+{{- end }}
