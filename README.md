@@ -165,6 +165,13 @@ indexer, HPA, PodDisruptionBudget, default-deny NetworkPolicies, Ingress with
 rate limiting, and a ServiceMonitor. Dev and prod differ only in values, the
 same way the Terraform environments do.
 
+Task 1 says "Choose one" between Terraform, Kubernetes manifests/Helm and
+Pulumi. Terraform is the chosen one and covers all four of the task's "Must
+include" items. The chart covers them as well - Namespace with Pod Security
+Admission at `restricted` as the k8s-side security baseline, ExternalSecret
+for the credential, and a DR section - so the Kubernetes path stands on its
+own rather than only as an illustration.
+
 It is a secondary artifact, not the deployment path. CI lints and renders it
 and checks the rendered manifests still run as non-root with limits, dropped
 capabilities and no credential as a literal, so it cannot rot, but no

@@ -1,5 +1,13 @@
 environment: prod
 
+namespace:
+  create: true
+  name: jenie-prod
+
+externalSecret:
+  enabled: true
+  remoteKey: jenie-prod-database-url
+
 api:
   replicas: 3
   resources:

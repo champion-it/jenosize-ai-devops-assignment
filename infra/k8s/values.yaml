@@ -4,6 +4,26 @@
 nameOverride: ""
 environment: dev
 
+namespace:
+  # Helm will not apply Pod Security Admission labels to a namespace it did
+  # not create, so the chart owns it when asked to.
+  create: false
+  name: jenie
+  # "restricted" is the strictest built-in level: no privilege escalation,
+  # non-root, seccomp required, all capabilities dropped. The workloads
+  # already satisfy it, so enforcing it costs nothing and stops a future
+  # workload from being admitted without those controls.
+  podSecurityLevel: restricted
+
+externalSecret:
+  # Off by default: it needs the External Secrets Operator CRDs. When on, the
+  # credential is pulled from the secret manager at runtime and the cluster
+  # holds no long-lived copy that a backup could leak.
+  enabled: false
+  secretStoreRef: gcp-secret-manager
+  remoteKey: jenie-dev-database-url
+  refreshInterval: 1h
+
 image:
   registry: asia-southeast1-docker.pkg.dev/CHANGEME/jenie
   api:

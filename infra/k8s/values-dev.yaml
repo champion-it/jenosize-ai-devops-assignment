@@ -1,5 +1,9 @@
 environment: dev
 
+namespace:
+  create: true
+  name: jenie-dev
+
 api:
   replicas: 1
   autoscaling:
