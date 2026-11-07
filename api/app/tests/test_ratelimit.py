@@ -29,3 +29,15 @@ def test_clients_are_counted_independently():
 def test_zero_limit_disables_the_check():
     limiter = FixedWindowRateLimiter(0)
     assert all(limiter.allow("1.2.3.4", now=0) for _ in range(100))
+
+
+def test_database_defaults_to_a_short_acquire_timeout():
+    """A database outage must fail fast, not hang.
+
+    The pool library defaults to 30 seconds, which turns an outage into
+    half-minute hangs that spend the latency budget on requests that were
+    never going to succeed.
+    """
+    from common.config import Settings
+
+    assert Settings().database_acquire_timeout <= 5.0

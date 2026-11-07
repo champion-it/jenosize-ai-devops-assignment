@@ -52,9 +52,30 @@ CREATE INDEX IF NOT EXISTS chunks_embedding_idx
 
 
 class Database:
-    def __init__(self, dsn: str, dim: int, min_size: int = 1, max_size: int = 8) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        dim: int,
+        min_size: int = 1,
+        max_size: int = 8,
+        acquire_timeout: float = 5.0,
+    ) -> None:
         self.dim = dim
-        self.pool = ConnectionPool(dsn, min_size=min_size, max_size=max_size, open=False)
+        # How long a request waits for a connection before giving up.
+        #
+        # psycopg_pool defaults to 30 seconds. With the database unreachable
+        # that turns every request into a 30 second hang before it finally
+        # returns 500: the caller has usually timed out by then, the latency
+        # budget is spent on requests that were never going to succeed, and
+        # the queue behind them grows. Failing in five seconds keeps the
+        # error signal fast and honest.
+        self.pool = ConnectionPool(
+            dsn,
+            min_size=min_size,
+            max_size=max_size,
+            timeout=acquire_timeout,
+            open=False,
+        )
 
     def open(self) -> None:
         self.pool.open(wait=True, timeout=30)

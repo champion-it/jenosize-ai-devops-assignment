@@ -15,7 +15,10 @@ from prometheus_client import CollectorRegistry, Counter, Histogram
 
 REGISTRY = CollectorRegistry()
 
-LATENCY_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
+# The 2.0 boundary exists because the latency SLO is "under 2 seconds".
+# A histogram can only answer questions its bucket edges line up with, so
+# the SLO picks the bucket rather than the bucket quietly redefining the SLO.
+LATENCY_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 2.5, 5.0, 10.0)
 
 http_requests_total = Counter(
     "http_requests_total",

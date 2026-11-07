@@ -119,11 +119,13 @@ attributed to the vector search or to the model without guessing.
 │   └── alerts/rules.yml         four alert rules
 ├── docs/
 │   ├── architecture.svg
-│   └── deployment-checklist.md  empty project to running service, in order
+│   ├── deployment-checklist.md  empty project to running service, in order
+│   └── slo.md                   SLIs, objectives, error budget, burn rates
 ├── data/                        12 markdown knowledge base documents
 ├── scripts/
 │   ├── eval.py                  retrieval evaluation and CI gate
 │   ├── check_manifests.py       security posture of the rendered chart
+│   ├── dora.py                  delivery metrics from git and the API
 │   └── eval_queries.json
 ├── .github/workflows/
 │   ├── ci.yml                   lint, test, scan, integration, build, push
@@ -316,12 +318,31 @@ deliberately not part of the service module, so the backend is not baked in.
 Dev samples everything, prod samples 10 percent, and sampling is
 `ParentBased`, so a sampled trace is never missing its middle.
 
-Alert rules in [`observability/alerts/rules.yml`](observability/alerts/rules.yml):
+### Service level objectives
 
-1. `HighErrorRate` - 5xx rate above 5 percent for 5 minutes.
-2. `HighAskLatency` - p95 on `/ask` above 2 seconds for 10 minutes.
-3. `RetrievalQualityDrop` - more than 20 percent of queries retrieve nothing.
-4. `ApiDown` - the metrics endpoint is unreachable.
+Defined in [`docs/slo.md`](docs/slo.md): availability 99% of requests
+non-5xx, and latency 99% of `/ask` within 2 seconds, both over a rolling 30
+days. The histogram carries a bucket edge at exactly 2.0 so the SLI measures
+what the objective claims rather than the nearest bucket.
+
+Alerting is on burn rate, not a static threshold. A fixed "error rate above
+5 percent" fires at the same point whether the service has been failing for
+thirty seconds or thirty minutes, and says nothing about whether the month
+is recoverable. Four tiers from 14.4x (pages, budget gone in two days) down
+to 1x (ticket), each requiring a long and a short window to agree so an
+alert resolves as quickly as the problem does. The error budget policy -
+what actually happens when it runs out - is in the same document.
+
+Alert rules in [`observability/alerts/rules.yml`](observability/alerts/rules.yml):
+12 recording rules for the SLIs, 7 burn-rate alerts, and 3 operational
+alerts for conditions a user-facing SLI cannot see (`ApiDown`,
+`RetrievalQualityDrop`, `AiCostSpike`).
+
+`scripts/dora.py` computes deployment frequency and lead time from the
+repository and workflow history. Change failure rate and time to restore are
+reported as unavailable rather than estimated: both need an incident record
+to join against, and a number derived from nothing would look measured
+without being measured.
 
 The Grafana dashboard
 ([`observability/grafana/dashboards/jenie-overview.json`](observability/grafana/dashboards/jenie-overview.json))
@@ -465,7 +486,7 @@ from the configuration.
 
 | Check | Result |
 | --- | --- |
-| Unit tests | 46 passed |
+| Unit tests | 47 passed |
 | Helm chart | lints clean on all three value sets; both environments render and pass the manifest security check |
 | `ruff check` / `ruff format --check` | clean |
 | `terraform validate`, dev and prod | both valid |
@@ -477,6 +498,8 @@ from the configuration.
 | Prometheus target | up, four alert rules loaded and healthy |
 | Grafana | dashboard provisioned, every panel query returns data |
 | Tracing | `jenie-api` and `jenie-worker` traces in Jaeger; `/ask` trace carries `rag.retrieve` and `rag.generate` children |
+| SLO rules | 22 rules load healthy; verified with no traffic (ratios 0, nothing fires) and with injected 5xx (10.1% error, correct tiers fire) |
+| Fail-fast | database stopped: `/ask` returns 5xx in 5s, not 30s |
 | Log correlation | every request log line carries `trace_id` and `span_id` |
 | Cold start | clean volumes, no `.env`, overridden host ports: stack up, ingest, `/ask`, eval, dashboards all working |
 
@@ -491,4 +514,4 @@ from the configuration.
 | Observability | 20% | `observability/`, section 9 |
 | Security | 15% | [SECURITY.md](SECURITY.md), section 11 |
 | AI workload readiness | 15% | `worker/`, `scripts/eval.py`, sections 3, 8 and 12 |
-| Documentation | 10% | this file, `SECURITY.md`, `infra/terraform/README.md`, `docs/deployment-checklist.md` |
+| Documentation | 10% | this file, `SECURITY.md`, `infra/terraform/README.md`, `docs/deployment-checklist.md`, `docs/slo.md` |

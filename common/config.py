@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     database_url: str = "postgresql://jenie:jenie@localhost:5432/jenie"
+    # Seconds a request waits for a pooled connection before failing.
+    database_acquire_timeout: float = 5.0
     redis_url: str | None = None
 
     embedding_provider: str = "hashing"

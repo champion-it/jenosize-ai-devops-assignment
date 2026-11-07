@@ -55,7 +55,11 @@ async def lifespan(app: FastAPI):
     )
     configure_logging(settings.service_name, settings.environment, settings.log_level)
 
-    database = Database(settings.database_url, settings.embedding_dim)
+    database = Database(
+        settings.database_url,
+        settings.embedding_dim,
+        acquire_timeout=settings.database_acquire_timeout,
+    )
     database.open()
     database.migrate()
 
