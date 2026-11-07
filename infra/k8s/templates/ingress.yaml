@@ -1,0 +1,29 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "jenie.fullname" . }}-api
+  labels:
+    {{- include "jenie.labels" . | nindent 4 }}
+  annotations:
+    # The edge is where rate limiting belongs; the in-process limiter in the
+    # application is the fallback for when this is not in front.
+    nginx.ingress.kubernetes.io/limit-rpm: {{ .Values.config.rateLimitPerMinute | quote }}
+    nginx.ingress.kubernetes.io/proxy-body-size: 64k
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "jenie.fullname" . }}-api
+                port:
+                  name: http
+{{- end }}

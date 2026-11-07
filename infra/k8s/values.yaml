@@ -1,0 +1,89 @@
+# Defaults. Environment files override only what differs, the same way the
+# Terraform environments do.
+
+nameOverride: ""
+environment: dev
+
+image:
+  registry: asia-southeast1-docker.pkg.dev/CHANGEME/jenie
+  api:
+    repository: api
+    tag: ""          # defaults to .Chart.AppVersion
+  worker:
+    repository: worker
+    tag: ""
+  pullPolicy: IfNotPresent
+
+api:
+  replicas: 2
+  port: 8000
+
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: "1",  memory: 512Mi }
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    # Scale out quickly, scale in slowly: a burst should not be throttled,
+    # and a lull should not thrash the deployment.
+    scaleDownStabilizationSeconds: 300
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  # Must exceed the application's graceful shutdown window so in-flight
+  # requests finish instead of being cut off mid-response.
+  terminationGracePeriodSeconds: 30
+
+indexer:
+  # The indexer is a scheduled batch job, never a long-running pod.
+  schedule: "0 3 * * *"
+  suspend: false
+  backoffLimit: 2
+  activeDeadlineSeconds: 1800
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: "1",  memory: 1Gi }
+
+config:
+  logLevel: INFO
+  embeddingProvider: hashing
+  embeddingDim: 768
+  llmProvider: mock
+  llmModel: mock-1
+  topK: 5
+  rateLimitPerMinute: 60
+  dataPath: /data
+  otelEndpoint: ""        # empty: spans created, not exported
+
+# DATABASE_URL is never templated into a manifest. It is read from a Secret
+# that an external operator populates, so the value never touches this
+# repository or a rendered chart.
+database:
+  existingSecret: jenie-database
+  secretKey: DATABASE_URL
+
+serviceAccount:
+  create: true
+  annotations: {}         # e.g. iam.gke.io/gcp-service-account for Workload Identity
+
+networkPolicy:
+  enabled: true
+  # CIDR the database is reachable on. Egress is denied to everything else.
+  databaseCIDR: 10.20.0.0/24
+  databasePort: 5432
+
+ingress:
+  enabled: false
+  className: nginx
+  host: jenie.example.com
+  annotations: {}
+
+serviceMonitor:
+  # Prometheus Operator scrape config. Off by default, since it needs CRDs.
+  enabled: false
+  interval: 10s

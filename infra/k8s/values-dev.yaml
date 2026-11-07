@@ -1,0 +1,16 @@
+environment: dev
+
+api:
+  replicas: 1
+  autoscaling:
+    enabled: false
+
+  podDisruptionBudget:
+    enabled: false
+
+config:
+  logLevel: DEBUG
+  rateLimitPerMinute: 120
+
+networkPolicy:
+  databaseCIDR: 10.20.0.0/24

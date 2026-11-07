@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "jenie.fullname" . }}-indexer
+  labels:
+    {{- include "jenie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: indexer
+spec:
+  schedule: {{ .Values.indexer.schedule | quote }}
+  timeZone: Asia/Bangkok
+  suspend: {{ .Values.indexer.suspend }}
+  # A run that overlaps the previous one would compete for the same rows.
+  # The job is idempotent, so skipping is the right answer, not queueing.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.indexer.backoffLimit }}
+      activeDeadlineSeconds: {{ .Values.indexer.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "jenie.labels" . | nindent 12 }}
+            app.kubernetes.io/component: indexer
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "jenie.serviceAccountName" . }}
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            fsGroup: 10001
+          containers:
+            - name: indexer
+              image: {{ include "jenie.workerImage" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args: ["--path", {{ .Values.config.dataPath | quote }}]
+              env:
+                {{- include "jenie.env" . | nindent 16 }}
+              resources:
+                {{- toYaml .Values.indexer.resources | nindent 16 }}
+              securityContext:
+                {{- include "jenie.securityContext" . | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 64Mi

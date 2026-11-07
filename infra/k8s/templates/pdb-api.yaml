@@ -1,0 +1,15 @@
+{{- if .Values.api.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "jenie.fullname" . }}-api
+  labels:
+    {{- include "jenie.labels" . | nindent 4 }}
+spec:
+  # Keeps a node drain or cluster upgrade from taking the service down.
+  minAvailable: {{ .Values.api.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "jenie.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+{{- end }}

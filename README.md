@@ -110,6 +110,7 @@ attributed to the vector search or to the model without guessing.
 │       ├── envs/dev/
 │       ├── envs/prod/
 │       └── README.md            state, ownership, DR and backup strategy
+│   └── k8s/                     Helm chart, alternative deployment path
 ├── observability/
 │   ├── grafana/
 │   │   ├── dashboards/          exported dashboard JSON
@@ -122,6 +123,7 @@ attributed to the vector search or to the model without guessing.
 ├── data/                        12 markdown knowledge base documents
 ├── scripts/
 │   ├── eval.py                  retrieval evaluation and CI gate
+│   ├── check_manifests.py       security posture of the rendered chart
 │   └── eval_queries.json
 ├── .github/workflows/
 │   ├── ci.yml                   lint, test, scan, integration, build, push
@@ -154,6 +156,23 @@ vendoring it twice.
 On AWS the mapping is ECS Fargate, RDS Postgres with pgvector, ECR and Secrets
 Manager. The application code does not change; only the `infra` module
 implementations would.
+
+### Running it on Kubernetes instead
+
+[`infra/k8s`](infra/k8s/README.md) is a Helm chart that runs the same two
+images on a cluster: Deployment and Service for the API, a CronJob for the
+indexer, HPA, PodDisruptionBudget, default-deny NetworkPolicies, Ingress with
+rate limiting, and a ServiceMonitor. Dev and prod differ only in values, the
+same way the Terraform environments do.
+
+It is a secondary artifact, not the deployment path. CI lints and renders it
+and checks the rendered manifests still run as non-root with limits, dropped
+capabilities and no credential as a literal, so it cannot rot, but no
+pipeline installs it and it has not been applied to a live cluster.
+
+The thing it cannot match is the release strategy. Canary on Kubernetes needs
+Argo Rollouts or a service mesh; on Cloud Run it is one `update-traffic`
+flag. That gap is a large part of why Cloud Run is the primary path.
 
 ---
 
@@ -316,9 +335,10 @@ indexer fails.
 1. `ruff check` and `ruff format --check`.
 2. `pytest` with coverage.
 3. Trivy filesystem scan for vulnerabilities, secrets and misconfiguration.
-4. Integration: start the stack, index the corpus, run the retrieval
+4. Helm lint, render both environments, and check the rendered manifests.
+5. Integration: start the stack, index the corpus, run the retrieval
    evaluation as a gate.
-5. Build both images, scan each with Trivy, and push only after the scan
+6. Build both images, scan each with Trivy, and push only after the scan
    passes, so a vulnerable image never reaches the registry.
 
 Images are tagged with `git describe` and with the commit SHA, so any deployed
@@ -439,6 +459,7 @@ from the configuration.
 | Check | Result |
 | --- | --- |
 | Unit tests | 46 passed |
+| Helm chart | lints clean on all three value sets; both environments render and pass the manifest security check |
 | `ruff check` / `ruff format --check` | clean |
 | `terraform validate`, dev and prod | both valid |
 | Workflow YAML, all three | valid; no event payload reaches a shell command |

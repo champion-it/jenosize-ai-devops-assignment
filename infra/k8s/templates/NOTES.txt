@@ -1,0 +1,20 @@
+{{ include "jenie.fullname" . }} is installed in namespace {{ .Release.Namespace }}.
+
+Before it becomes ready, the database secret must exist:
+
+  kubectl create secret generic {{ .Values.database.existingSecret }} \
+    --namespace {{ .Release.Namespace }} \
+    --from-literal={{ .Values.database.secretKey }}='postgresql://user:pass@host:5432/jenie'
+
+In a real cluster this is created by External Secrets or Sealed Secrets, not
+by hand, so the value never passes through a shell history.
+
+Check it:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "jenie.fullname" . }}-api
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "jenie.fullname" . }}-api 8000:80
+  curl localhost:8000/healthz
+
+Index the knowledge base without waiting for the schedule:
+
+  kubectl -n {{ .Release.Namespace }} create job --from=cronjob/{{ include "jenie.fullname" . }}-indexer indexer-manual

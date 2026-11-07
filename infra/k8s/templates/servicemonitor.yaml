@@ -1,0 +1,18 @@
+{{- if .Values.serviceMonitor.enabled }}
+# Requires the Prometheus Operator CRDs, which is why it is opt-in.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "jenie.fullname" . }}-api
+  labels:
+    {{- include "jenie.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "jenie.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}
